@@ -16,7 +16,7 @@ from filters.base import Filter
 from filters.volatility_filter import VolatilityFilter
 from strategies.rise_fall_montecarlo_strategy import RiseFallMontecarloStrategy
 from risk.recovery_matrix_calculator import RecoveryMatrixCalculator, TradeResult
-from config import settings
+from config.config import settings
 
 logger = logging.getLogger(__name__)
 

@@ -6,7 +6,7 @@ from typing import Literal
 from derivpy import RestClient
 from core.engine import TradingEngine
 from utils.logger import setup_logger
-from config import settings
+from config.config import settings
 
 logger = logging.getLogger(__name__)
 
