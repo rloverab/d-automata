@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "d-automata"
+version = "0.1.0"
+description = "Bot de trading automatizado para Deriv mediante CLI y WebSockets"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    # Aquí tus dependencias de producción (ejemplo basado en vuestra charla previa)
+    "pydantic>=2.14.2",
+    "pydantic-settings>=2.16.2",
+    "numpy>=2.5.4",
+    "derivpy@git+https://github.com/rloverab/derivpy.git@develop"
+    # "CouchDB>=1.2", # O la librería que uses para CouchDB
+    # "derivpy",    # Tu librería local o empaquetada
+]
+
+[project.scripts]
+# Esto crea el ejecutable "dauto" en tu terminal que apunta a la función main() dentro de main.py
+dauto = "main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]     # Le indica a setuptools que los paquetes están dentro de src
+
+[tool.setuptools]
+package-dir = {"" = "src"} # Trata el contenido de src como la raíz de importación

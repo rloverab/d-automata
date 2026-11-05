@@ -1,0 +1,1 @@
+# Carpeta para agrupar todos los stores específicos

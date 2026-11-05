@@ -1,0 +1,1 @@
+# El núcleo operativo del bot

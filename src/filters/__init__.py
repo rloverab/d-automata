@@ -1,0 +1,1 @@
+# Filtros de validación de señales
