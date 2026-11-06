@@ -27,8 +27,6 @@ async def run_trading(symbol: str, mode: Literal["real", "demo"] = "demo") -> No
     if account:
         engine = TradingEngine(account_id=account.account_id, symbol=symbol)
         await engine.start()
-    
-    print(f"[Simulación] El bot estaría operando en {symbol} ahora mismo...")
 
 def main():
     # 1. Configurar el sistema de logs global al arrancar la CLI

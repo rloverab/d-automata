@@ -1,6 +1,7 @@
 import logging
 
 import numpy as np
+from config.filters_config import VolatilityParams
 from core.models import Signal
 from derivpy import Tick
 
@@ -13,9 +14,9 @@ class VolatilityFilter(Filter):
     Filtro de rechazo que descarta señales si la volatilidad reciente 
     (desviación estándar de los diffs) está por debajo de un umbral mínimo.
     """
-    def __init__(self, min_volatility: float = 0.0001, lookback: int = 100):
-        self.min_volatility = min_volatility
-        self.lookback = lookback
+    def __init__(self, params: VolatilityParams):
+        self.min_volatility = params.min_volatility
+        self.lookback = params.lookback
 
     def __call__(self, signal: Signal) -> Signal | None:
         if not signal.data:

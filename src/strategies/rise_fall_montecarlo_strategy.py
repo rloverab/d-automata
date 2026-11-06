@@ -4,6 +4,7 @@ import logging
 import numpy as np
 from typing import Any, Literal
 from derivpy import Tick, Candle
+from config.strategies_config import RiseFallMontecarloParams
 from core.models import Signal
 from strategies.base import Strategy
 
@@ -15,18 +16,12 @@ class RiseFallMontecarloStrategy(Strategy):
     Modela la distribución de los cambios (diffs) de los últimos N ticks 
     para predecir la suma de los cambios en los próximos 'duration' ticks.
     """
-    
-    def __init__(
-        self, 
-        window_size: int = 2000, 
-        simulations: int = 10000, 
-        threshold: float = 0.55,
-        min_data_points: int = 100
-    ):
-        self.window_size = window_size
-        self.simulations = simulations
-        self.threshold = threshold
-        self.min_data_points = min_data_points
+        
+    def __init__(self, params: RiseFallMontecarloParams):
+        self.window_size = params.window_size
+        self.simulations = params.simulations
+        self.threshold = params.threshold
+        self.min_data_points = params.min_data_points
 
     def get_signal(
         self,
@@ -87,8 +82,10 @@ class RiseFallMontecarloStrategy(Strategy):
         direction = None
         if prob_rise >= self.threshold:
             direction = "CALL"
+            # direction = "PUT"
         elif prob_fall >= self.threshold:
             direction = "PUT"
+            # direction = "CALL"
             
         # 7. Emisión de la Señal
         if direction:

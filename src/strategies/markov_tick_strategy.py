@@ -3,14 +3,16 @@ import time
 from derivpy import Tick
 import numpy as np
 
+from config.strategies_config import MarkovTickParams
 from core.models import Signal
 from strategies.base import Strategy
 
 
 class MarkovTickStrategy(Strategy):
-    def __init__(self, estimated_window: int = 2000):
+    # def __init__(self, estimated_window: int = 2000):
+    def __init__(self, params: MarkovTickParams):
         # Estados
-        self.estimated_window = estimated_window
+        self.estimated_window = params.estimated_window
         self.ESTADOS = [
             'UP_LOW', 'UP_MED', 'UP_HIGH',
             'FLAT_LOW', 'FLAT_MED', 'FLAT_HIGH',
@@ -23,18 +25,21 @@ class MarkovTickStrategy(Strategy):
 
         # Contador para reestimación (FIX: no usar len(buffer))
         self.ticks_desde_ultima_estimacion = 0
-        self.intervalo_reestimacion = 200  # ticks
+        # self.intervalo_reestimacion = 200  # ticks
+        self.intervalo_reestimacion = params.intervalo_reestimacion  # ticks
 
         # Timestamp para reestimación temporal (backup)
         self.ultima_reestimacion_time = time.time()
         self.intervalo_reestimacion_time = 300  # segundos
 
         # Umbrales (AJUSTADOS)
-        self.UMBRAL_PROB = 0.50  # más realista para 9 estados
+        # self.UMBRAL_PROB = 0.50  # más realista para 9 estados
+        self.UMBRAL_PROB = params.umbral_prob  # más realista para 9 estados
         self.UMBRAL_HIT_RATE_MIN = 0.52  # apenas mejor que aleatorio
 
         # Ventana de análisis para características
-        self.ventana_caracteristicas = 15  # REDUCIDA para coherencia con duración 10
+        self.ventana_caracteristicas = params.ventana_caracteristicas  # REDUCIDA para coherencia con duración 10
+        # self.ventana_caracteristicas = 15  # REDUCIDA para coherencia con duración 10
         # self.ventana_caracteristicas = 1500  # REDUCIDA para coherencia con duración 10
 
         self._ultima_actualizacion: Tick | None = None
