@@ -3,7 +3,7 @@ version: "1.2.0" # Vital para la trazabilidad en CouchDB
 
 rise_fall_montecarlo:
   window_size: 2000
-  simulations: 1000 # Og: 10000 (prueba buena #1: 5000. prueba muy buena #2: 2000) FINO: 1000
+  simulations: 10000 # Og: 10000 (prueba buena #1: 5000. prueba muy buena #2: 2000) FINO: 1000
   threshold: 0.51 # Og: 0.55
   min_data_points: 100
 

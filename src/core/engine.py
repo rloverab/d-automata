@@ -6,16 +6,27 @@ Arquitectura: Producer-Consumer con manejo robusto de errores
 import asyncio
 from collections import deque
 from datetime import UTC, datetime
+import json
+from random import randint, shuffle
 from typing import Optional
 import logging
 
 from derivpy import MarketDataClient, OpenContract, Tick, TradingClient
 from derivpy.exceptions import DerivAPIError, DerivConnectionError
+import numpy as np
 from config.filters_config import load_filters_config
 from config.strategies_config import load_strategies_config
 from core.models import Signal
 from filters.base import Filter
+from filters.spread_trend_filter import SpreadTrendFilter
 from filters.volatility_filter import VolatilityFilter
+from filters.volatility_regime_filter import VolatilityRegimeFilter
+from filters.volatility_regime_filter_v2 import VolatilityRegimeFilterV2
+from strategies.experimental_strategy import ExperimentalStrategy
+from strategies.markov_regime_strategy import MarkovRegimeStrategy
+from strategies.momentum_pullback_adaptive_strategy import MomentumPullbackAdaptiveStrategy
+from strategies.momentum_pullback_five_strategy import MomentumPullbackFive
+from strategies.momentum_pullback_velocity_strategy import MomentumPullbackVelocityStrategy
 from strategies.rise_fall_montecarlo_strategy import RiseFallMontecarloStrategy
 from risk.recovery_matrix_calculator import RecoveryMatrixCalculator, TradeResult
 from config.config import settings
@@ -42,33 +53,55 @@ class TradingEngine:
         self.tick_queue = asyncio.Queue(maxsize=100)  # Cola para procesamiento
         
         # Estrategia y filtros
+        # self.strategy = MarkovRegimeStrategy(
+        #     target_horizon=5,
+        #     prob_threshold=0.25
+        # )
         # self.strategy = RiseFallMontecarloStrategy(
         #     simulations=5000,
         #     threshold=0.51
         # )
-        self.strategy = RiseFallMontecarloStrategy(strategy_params.rise_fall_montecarlo)
+        # self.strategy = RiseFallMontecarloStrategy(strategy_params.rise_fall_montecarlo)
         # self.filter: Filter | None = VolatilityFilter(
         #     lookback=200
         # )
-        self.filter = VolatilityFilter(filters_params.volatility)
+        # self.strategy = ExperimentalStrategy()
+        # self.strategy = MomentumPullbackAdaptiveStrategy()
+        self.strategy = MomentumPullbackVelocityStrategy(
+            impulse_ticks=3,
+            min_velocity_ratio=1.25
+        )
+        # self.strategy = MomentumPullbackFive()
+        self.filters = [
+            # VolatilityFilter(filters_params.volatility),
+            # SpreadTrendFilter()
+
+            VolatilityRegimeFilterV2(
+                min_efficiency=0.30,
+                spike_multiplier=2.5
+                # window=25
+            )
+
+            # VolatilityRegimeFilter(min_efficiency=0.30)
+        ]
         
         # Gestión de capital
         self.recovery_matrix_calculator = RecoveryMatrixCalculator(
-            payout_pct=91.5, max_trades=12, target_wins=5,            
+            payout_pct=90.5, max_trades=3, target_wins=1,
             use_early_exit=True,
             early_exit_threshold=0.70, # Default            
             # early_exit_threshold=0.638, # Default            
             # early_exit_threshold=0.344, # Emular comportamiento previo errado
-            use_trailing_stop=True,
+            use_trailing_stop=not True,
             trailing_stop_pct=0.40,           # Corta si cae 40% desde el máximo
             use_min_viability=False,           # Activa C
             min_viability_pct=0.10            # No arriesga si el trade es < 10% del capital restante
         )
         self.trade_results: list[TradeResult] = []
-        self.capital: float = 15.0
+        self.capital: float = 20.0
         self.remaining_capital: float = self.capital
-        self.take_profit: float = 10240.0  # TODO: Mover a config
-        self.stop_loss: float = 9955.0     # TODO: Mover a config
+        self.take_profit: float = 10200.0  # TODO: Mover a config
+        self.stop_loss: float = 9960.0     # TODO: Mover a config
         
         # Estado
         self.last_update: Optional[Tick] = None
@@ -401,9 +434,10 @@ class TradingEngine:
                 # 3. Obtener señal
                 signals_attempted += 1
                 signal = self.strategy.get_signal(
-                    data=self.ticks_buffer, 
+                    data=list(self.ticks_buffer),
                     duration=1
                 )
+                # signal = self.get_signal(duration=1)
 
                 if signal is None:
                     continue
@@ -411,8 +445,11 @@ class TradingEngine:
                 signals_generated += 1
 
                 # 4. Filtrar señal
-                if self.filter is not None:
-                    signal = self.filter(signal)
+                for filter in self.filters:
+                    signal = filter(signal)
+
+                    if signal is None:
+                        break
 
                 if signal is None:
                     continue
@@ -498,6 +535,11 @@ class TradingEngine:
         if not self._trading_client.is_connected:
             logger.warning("⚠️ Cliente desconectado, omitiendo trade")
             return False
+
+        # Experimental        
+        # random_number = randint(1, 100)
+        # if random_number <= 60:
+        #     return False
         
         # 2. Verificar capital mínimo de la ronda
         if self.remaining_capital < self.recovery_matrix_calculator.min_bet:
@@ -722,6 +764,9 @@ class TradingEngine:
                 duration=signal.duration,
                 duration_unit=signal.duration_unit
             )
+
+            # LOG Temporal
+            print(json.dumps(signal.extras,indent=4))
             
             # Esperar expiración del contrato
             max_wait = signal.duration * 2 + 30
@@ -747,11 +792,11 @@ class TradingEngine:
             for attempt in range(max_retries):
                 try:
                     contract = await self._trading_client.get_contract(br.contract_id)
+                    await asyncio.sleep(5.0)
                     break
                 except DerivConnectionError:
                     if attempt < max_retries - 1:
                         logger.warning(f"🔄 Retry {attempt + 1}/{max_retries} para obtener contrato")
-                        await asyncio.sleep(3.0)
                     else:
                         logger.error(f"❌ No se pudo obtener resultado del contrato {br.contract_id}")
                         return
@@ -906,7 +951,7 @@ class TradingEngine:
             self._seconds_per_tick = ticks[-1].epoch - ticks[-2].epoch
             self.ticks_buffer.clear()
             self.ticks_buffer.extend(ticks)
-            
+
             if verbose:
                 logger.info(f"✅ Cargados {len(ticks)} ticks históricos")
                 
@@ -934,6 +979,11 @@ class TradingEngine:
             
             # Finalizar y registrar la ronda antes de resetear
             await self._finalize_round(bet_info["status"])
+
+            # Experimental: Reiniciar conexion en TradingClient si se pierde una ronda
+            await self._trading_client.disconnect()
+            await asyncio.sleep(2.0)
+            await self._trading_client.connect()
             
             # Intentar iniciar una nueva ronda
             can_continue = await self._initialize_new_round()
@@ -980,7 +1030,7 @@ class TradingEngine:
 
             # --- ASIGNACIÓN DE CAPITAL PARA LA NUEVA RONDA ---
             # Tu lógica: $15 por ronda si es posible. Si quedan $14, se asignan $14.
-            round_allocation = 15.0  # Puedes mover esto a `config.py`
+            round_allocation = 20.0  # Puedes mover esto a `config.py`
             new_round_capital = min(round_allocation, current_total_balance)
 
             # 1. Guardar el capital con el que inicia la ronda
@@ -1060,3 +1110,65 @@ class TradingEngine:
             await self._market_data_client.disconnect()
             await self._trading_client.disconnect()
             logger.info("✅ Motor detenido correctamente")
+
+    def get_signal(self, duration: int, lookback: int = 15):
+        if len(self.ticks_buffer) < lookback:
+            return None
+        
+        ticks: list[Tick] = list(self.ticks_buffer)[-lookback:]
+        high_tick = max(ticks, key=lambda t: t.quote)
+        low_tick = min(ticks, key=lambda t: t.quote)
+        pip_size = ticks[-1].pip_size
+        call_signals: list[Signal] = []
+        put_signals: list[Signal] = []
+        count_none: int = 0
+        step = 1 / (10 ** pip_size)
+
+        for quote in np.arange(low_tick.quote, high_tick.quote + step, step):
+            ticks_buffer = self.ticks_buffer.copy()
+            tick: Tick = ticks_buffer[-1]
+            t = Tick(
+                epoch=tick.epoch + self._seconds_per_tick, 
+                quote=quote,
+                pip_size=pip_size
+            )
+            # tick.epoch += self._seconds_per_tick
+            # tick.quote = quote
+            ticks_buffer.append(t)
+            
+            signal = self.strategy.get_signal(
+                data=ticks_buffer,
+                duration=duration,
+                duration_unit="t"
+            )
+
+            if signal is None:
+                count_none += 1
+            else:
+                signal.data = self.ticks_buffer
+
+                if signal.direction == "CALL":
+                    call_signals.append(signal)
+                    # put_signals.append(signal)
+                else:
+                    put_signals.append(signal)
+                    # call_signals.append(signal)
+
+        len_call_signals: int = len(call_signals)
+        len_put_signals: int = len(put_signals)
+        total = len_call_signals + len_put_signals # + count_none
+
+        if total == 0:
+            return None
+
+        max_threshold = 1.0
+        min_threshold = 0.51
+        if min_threshold <= (len_call_signals / total) <= max_threshold:
+            return call_signals[-1]
+            # return put_signals[-1]        
+        if min_threshold <= (len_put_signals / total) <= max_threshold:
+            return put_signals[-1]
+            # return call_signals[-1]
+                
+        return None
+
