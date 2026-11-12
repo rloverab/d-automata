@@ -68,8 +68,8 @@ class TradingEngine:
         # self.strategy = ExperimentalStrategy()
         # self.strategy = MomentumPullbackAdaptiveStrategy()
         self.strategy = MomentumPullbackVelocityStrategy(
-            impulse_ticks=3,
-            min_velocity_ratio=1.25
+            impulse_ticks=1, #3,
+            min_velocity_ratio=1.1 #1.25
         )
         # self.strategy = MomentumPullbackFive()
         self.filters = [
@@ -78,8 +78,8 @@ class TradingEngine:
 
             VolatilityRegimeFilterV2(
                 min_efficiency=0.30,
-                spike_multiplier=2.5
-                # window=25
+                spike_multiplier=2.5,
+                window=16
             )
 
             # VolatilityRegimeFilter(min_efficiency=0.30)
@@ -87,18 +87,18 @@ class TradingEngine:
         
         # Gestión de capital
         self.recovery_matrix_calculator = RecoveryMatrixCalculator(
-            payout_pct=90.5, max_trades=3, target_wins=1,
-            use_early_exit=True,
+            payout_pct=90.0, max_trades=4, target_wins=1,
+            use_early_exit=False,
             early_exit_threshold=0.70, # Default            
             # early_exit_threshold=0.638, # Default            
             # early_exit_threshold=0.344, # Emular comportamiento previo errado
-            use_trailing_stop=not True,
+            use_trailing_stop=False,
             trailing_stop_pct=0.40,           # Corta si cae 40% desde el máximo
             use_min_viability=False,           # Activa C
             min_viability_pct=0.10            # No arriesga si el trade es < 10% del capital restante
         )
         self.trade_results: list[TradeResult] = []
-        self.capital: float = 20.0
+        self.capital: float = 15.0
         self.remaining_capital: float = self.capital
         self.take_profit: float = 10200.0  # TODO: Mover a config
         self.stop_loss: float = 9960.0     # TODO: Mover a config
@@ -1030,7 +1030,7 @@ class TradingEngine:
 
             # --- ASIGNACIÓN DE CAPITAL PARA LA NUEVA RONDA ---
             # Tu lógica: $15 por ronda si es posible. Si quedan $14, se asignan $14.
-            round_allocation = 20.0  # Puedes mover esto a `config.py`
+            round_allocation = 15.0  # Puedes mover esto a `config.py`
             new_round_capital = min(round_allocation, current_total_balance)
 
             # 1. Guardar el capital con el que inicia la ronda

@@ -25,7 +25,7 @@ class RecoveryMatrixCalculator:
         use_min_viability: bool = False,
         min_viability_pct: float = 0.10
     ):
-        self.payout = payout_pct / 100.0
+        self.payout_pct = payout_pct / 100.0
         self.max_trades = max_trades
         self.target_wins = target_wins
         self.min_bet = min_bet
@@ -45,7 +45,7 @@ class RecoveryMatrixCalculator:
     def _build_matrix(self) -> np.ndarray:
         n = self.max_trades
         e = self.target_wins
-        profit = self.payout
+        profit = self.payout_pct
         
         matrix = np.full((n, e + 1), np.nan)
         
@@ -92,8 +92,8 @@ class RecoveryMatrixCalculator:
             r1c0 = self.matrix[r + 1, c]
             r1c1 = self.matrix[r + 1, c + 1]
             
-            if not np.isnan(r1c0) and not np.isnan(r1c1) and (r1c0 + self.payout * r1c1) != 0:
-                a = 1 - ((self.payout + 1) * r1c1) / (r1c0 + self.payout * r1c1)
+            if not np.isnan(r1c0) and not np.isnan(r1c1) and (r1c0 + self.payout_pct * r1c1) != 0:
+                a = 1 - ((self.payout_pct + 1) * r1c1) / (r1c0 + self.payout_pct * r1c1)
                 next_bet = a * current_round_capital
             else:
                 next_bet = current_round_capital
