@@ -7,7 +7,6 @@ import asyncio
 from collections import deque
 from datetime import UTC, datetime
 import json
-from random import randint, shuffle
 from typing import Optional
 import logging
 
@@ -17,17 +16,8 @@ import numpy as np
 from config.filters_config import load_filters_config
 from config.strategies_config import load_strategies_config
 from core.models import Signal
-from filters.base import Filter
-from filters.spread_trend_filter import SpreadTrendFilter
-from filters.volatility_filter import VolatilityFilter
-from filters.volatility_regime_filter import VolatilityRegimeFilter
 from filters.volatility_regime_filter_v2 import VolatilityRegimeFilterV2
-from strategies.experimental_strategy import ExperimentalStrategy
-from strategies.markov_regime_strategy import MarkovRegimeStrategy
-from strategies.momentum_pullback_adaptive_strategy import MomentumPullbackAdaptiveStrategy
-from strategies.momentum_pullback_five_strategy import MomentumPullbackFive
 from strategies.momentum_pullback_velocity_strategy import MomentumPullbackVelocityStrategy
-from strategies.rise_fall_montecarlo_strategy import RiseFallMontecarloStrategy
 from risk.recovery_matrix_calculator import RecoveryMatrixCalculator, TradeResult
 from config.config import settings
 
@@ -77,9 +67,9 @@ class TradingEngine:
             # SpreadTrendFilter()
 
             VolatilityRegimeFilterV2(
-                min_efficiency=0.30,
+                # min_efficiency=0.30,
                 spike_multiplier=2.5,
-                window=16
+                window=30
             )
 
             # VolatilityRegimeFilter(min_efficiency=0.30)
@@ -87,7 +77,7 @@ class TradingEngine:
         
         # Gestión de capital
         self.recovery_matrix_calculator = RecoveryMatrixCalculator(
-            payout_pct=90.0, max_trades=4, target_wins=1,
+            payout_pct=91.5, max_trades=2, target_wins=1,
             use_early_exit=False,
             early_exit_threshold=0.70, # Default            
             # early_exit_threshold=0.638, # Default            
@@ -100,7 +90,7 @@ class TradingEngine:
         self.trade_results: list[TradeResult] = []
         self.capital: float = 15.0
         self.remaining_capital: float = self.capital
-        self.take_profit: float = 10200.0  # TODO: Mover a config
+        self.take_profit: float = 10100.0  # TODO: Mover a config
         self.stop_loss: float = 9960.0     # TODO: Mover a config
         
         # Estado
@@ -435,7 +425,7 @@ class TradingEngine:
                 signals_attempted += 1
                 signal = self.strategy.get_signal(
                     data=list(self.ticks_buffer),
-                    duration=1
+                    duration=8
                 )
                 # signal = self.get_signal(duration=1)
 
