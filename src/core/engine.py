@@ -7,12 +7,14 @@ import asyncio
 from collections import deque
 from datetime import UTC, datetime
 import json
+import math
 from typing import Optional
 import logging
 
 from derivpy import MarketDataClient, OpenContract, Tick, TradingClient
 from derivpy.exceptions import DerivAPIError, DerivConnectionError
 import numpy as np
+from backtest.engine import BacktestingEngine
 from config.filters_config import load_filters_config
 from config.strategies_config import load_strategies_config
 from core.models import Signal
@@ -39,7 +41,7 @@ class TradingEngine:
         self.symbol = symbol
         
         # Buffer de ticks (producer)
-        self.ticks_buffer = deque(maxlen=2000)
+        self.ticks_buffer = deque(maxlen=3600)
         self.tick_queue = asyncio.Queue(maxsize=100)  # Cola para procesamiento
         
         # Estrategia y filtros
@@ -74,6 +76,28 @@ class TradingEngine:
 
             # VolatilityRegimeFilter(min_efficiency=0.30)
         ]
+        self.duration = 8
+
+        self.backtest = BacktestingEngine(
+            strategy=self.strategy,
+            filters=self.filters,
+            max_concurrent_trades=1,
+            initial_capital=40.0,
+            round_allocation=15.0,
+            take_profit=1000.0,
+            stop_loss=0.0,
+            use_fixed_stake=False,
+            fixed_stake_amount=1.0,
+            recovery_matrix_params={
+                "payout_pct": 91.5,
+                "max_trades": 2,
+                "target_wins": 1,
+                "use_early_exit": False,
+                "early_exit_threshold": 0.9,
+                "use_trailing_stop": False,
+                "trailing_stop_pct": 0.40
+            }
+        )
         
         # Gestión de capital
         self.recovery_matrix_calculator = RecoveryMatrixCalculator(
@@ -210,170 +234,6 @@ class TradingEngine:
         if task.exception():
             logger.error(f"❌ Trade terminado con error no manejado: {task.exception()}")
 
-    # async def _signal_consumer(self) -> None:
-    #     """Consumer con validación de concurrencia y manejo de cooldown y monitor de salud."""
-        
-    #     # Contadores de flujo de datos
-    #     ticks_processed = 0          # Ticks que entraron al sistema
-    #     signals_attempted = 0        # Veces que se llamó a get_signal()
-    #     signals_generated = 0        # Señales válidas retornadas (no None)
-    #     signals_passed_filter = 0    # Señales que pasaron todos los filtros
-    #     signals_executed = 0         # Señales que se convirtieron en trades
-    #     signals_ommited = 0          # Señales omitidas por cooldown
-        
-    #     last_log_time = asyncio.get_event_loop().time()
-
-    #     while self._is_running:
-    #         try:
-    #             try:
-    #                 tick = await asyncio.wait_for(self.tick_queue.get(), timeout=1.0)
-    #                 ticks_processed += 1
-            
-    #                 # Log de salud cada 60 segundos
-    #                 current_time = asyncio.get_event_loop().time()
-    #                 if current_time - last_log_time > 60.0:
-    #                     logger.debug(
-    #                         f"📊 Métricas del motor (últimos 60s):\n"
-    #                         f"  ├─ Ticks procesados: {ticks_processed}\n"
-    #                         f"  ├─ Evaluaciones intentadas: {signals_attempted}\n"
-    #                         f"  ├─ Señales generadas: {signals_generated}\n"
-    #                         f"  ├─ Señales post-filtro: {signals_passed_filter}\n"
-    #                         f"  ├─ Señales omitidas: {signals_ommited}\n"
-    #                         f"  ├─ Trades ejecutados: {signals_executed}\n"
-    #                         f"  ├─ Cola pendiente: {self.tick_queue.qsize()}\n"
-    #                         f"  └─ Trades activos: {len(self._active_trades)}"
-    #                     )
-    #                     # Resetear contadores para el próximo período
-    #                     ticks_processed = signals_attempted = signals_generated = 0
-    #                     signals_passed_filter = signals_executed = 0
-    #                     last_log_time = current_time
-    #             except asyncio.TimeoutError:
-    #                 continue
-                
-    #             # 0. ACTUALIZAR MATRIZ (si aplica)
-    #             # self.strategy.actualizar_matriz(self.ticks_buffer)
-                
-    #             # 1. GESTIONAR ESTADO DE LA RONDA
-    #             if not await self._ensure_active_round():
-    #                 continue
-                
-    #             # 2. MANEJAR COOLDOWN
-    #             if self._in_cooldown:
-    #                 # Verificar si la señal virtual actual ha expirado
-    #                 if self._cooldown_until_epoch is not None:
-    #                     if tick.epoch >= self._cooldown_until_epoch:
-    #                         # La señal virtual expiró
-    #                         self._cooldown_signals_omitted += 1
-    #                         logger.info(
-    #                             f"⏸️ Cooldown: Señal virtual {self._cooldown_signals_omitted}/"
-    #                             f"{self._cooldown_omissions} completada (omitida)"
-    #                         )
-                            
-    #                         # Verificar si completamos todas las omisiones
-    #                         if self._cooldown_signals_omitted >= self._cooldown_omissions:
-    #                             logger.info(
-    #                                 f"✅ Cooldown finalizado: {self._cooldown_omissions} señales omitidas. "
-    #                                 f"Reanudando operaciones normales."
-    #                             )
-    #                             self._in_cooldown = False
-    #                             self._cooldown_signals_omitted = 0
-    #                             self._cooldown_until_epoch = None
-    #                             # Resetear contador de losses consecutivos
-    #                             self._consecutive_losses = 0
-    #                         else:
-    #                             # Resetear para esperar la próxima señal
-    #                             self._cooldown_until_epoch = None
-                    
-    #                 # Si estamos en cooldown pero no hay señal virtual activa, 
-    #                 # buscar una nueva señal para omitir
-    #                 if self._in_cooldown and self._cooldown_until_epoch is None:
-    #                     # Validar concurrencia antes de buscar señal
-    #                     if not self._can_execute_trade():
-    #                         continue
-                        
-    #                     # Obtener señal
-    #                     signals_attempted += 1 # INCREMENTAR "attempted"
-    #                     signal = self.strategy.get_signal(
-    #                         data=self.ticks_buffer, 
-    #                         duration=5
-    #                     )
-
-    #                     if signal is None:
-    #                         continue # No hay señal, no incrementamos "generated"
-
-    #                     # Señal válida generada
-    #                     signals_generated += 1
-
-    #                     # Filtrar señal                        
-    #                     if self.filter is not None:
-    #                         signal = self.filter(signal)
-
-    #                     if signal is None:
-    #                         continue # Filtrada, no incrementamos "passed_filter"
-                                                
-    #                     # Señal pasó todos los filtros
-    #                     signals_passed_filter += 1
-
-    #                     # Señal omitida por cooldown
-    #                     signals_ommited += 1
-
-    #                     # Iniciar período de omisión para esta señal
-    #                     last_tick: Tick = self.ticks_buffer[-1]
-    #                     diff_secs = tick.epoch - last_tick.epoch
-    #                     self._cooldown_until_epoch = tick.epoch + (signal.duration * diff_secs)
-    #                     logger.info(
-    #                         f"⏸️ Cooldown activo: Omitiendo señal {signal.direction} "
-    #                         f"(duración: {signal.duration} ticks)"
-    #                     )
-                    
-    #                 # En cooldown, no procesar nada más
-    #                 continue
-                
-    #             # 3. VALIDAR CONCURRENCIA (fuera de cooldown)
-    #             if not self._can_execute_trade():
-    #                 continue
-                
-    #             # 4. Obtener señal
-    #             signals_attempted += 1 # INCREMENTAR "attempted"
-    #             signal = self.strategy.get_signal(
-    #                 data=self.ticks_buffer, 
-    #                 duration=5
-    #             )
-
-    #             if signal is None:
-    #                 continue # No hay señal, no incrementamos "generated"
-
-    #             # Señal válida generada
-    #             signals_generated += 1
-
-    #             # Filtrar señal
-    #             if self.filter is not None:
-    #                 signal = self.filter(signal)
-
-    #             if signal is None:
-    #                 continue # Filtrada, no incrementamos "passed_filter"
-
-    #              # Señal pasó todos los filtros
-    #             signals_passed_filter += 1
-
-    #             # 5. Calcular monto
-    #             bet = self.recovery_matrix_calculator.calculate_next_bet(
-    #                 self.trade_results,
-    #                 self.remaining_capital
-    #             )
-                
-    #             # 6. Ejecutar
-    #             trade_task = asyncio.create_task(self._execute_trade(signal, bet))
-    #             trade_task.add_done_callback(self._cleanup_trade_task)
-    #             self._active_trades.add(trade_task)
-
-    #             # Trade lanzado (no necesariamente ejecutado aún)
-    #             signals_executed += 1
-                
-    #         except Exception as e:
-    #             logger.error(f"❌ Error en consumer: {e}", exc_info=True)
-    #             await asyncio.sleep(1.0)
-
     async def _signal_consumer(self) -> None:
         """Consumer que maneja cooldown como omisión de señales individuales."""
         
@@ -425,7 +285,7 @@ class TradingEngine:
                 signals_attempted += 1
                 signal = self.strategy.get_signal(
                     data=list(self.ticks_buffer),
-                    duration=8
+                    duration=self.duration
                 )
                 # signal = self.get_signal(duration=1)
 
@@ -549,193 +409,6 @@ class TradingEngine:
             return False
         
         return True
-
-    # async def _execute_trade(self, signal: Signal, bet) -> None:
-    #     """
-    #     Ejecuta un trade individual con manejo robusto de errores.
-    #     Esta función corre en background y no bloquea el stream.
-    #     """
-    #     try:
-    #         logger.info(f"💼 Ejecutando trade: {signal.direction} @ {bet['next_bet']}")
-            
-    #         # 1. Verificar conexión antes de operar
-    #         if not self._trading_client.is_connected:
-    #             logger.error("🔌 No conectado, abortando trade")
-    #             return
-            
-    #         # 2. Ejecutar trade
-    #         br = await self._trading_client.trade(
-    #             contract_type=signal.direction,
-    #             underlying_symbol=self.symbol,
-    #             amount=float(round(bet['next_bet'], 2)),
-    #             duration=signal.duration,
-    #             duration_unit=signal.duration_unit
-    #         )
-            
-    #         # 3. Esperar expiración del contrato
-    #         contract_expired = False
-    #         # Timeout máximo de espera: duración del contrato + 30 segundos de buffer
-    #         max_wait = signal.duration * 2 + 30  # Ajustar según duración en segundos
-
-    #         try:
-    #             async with asyncio.timeout(max_wait):
-    #                 async for c in self._trading_client.watch_contract(
-    #                     br.contract_id, 
-    #                     stop_when_closed=False
-    #                 ):
-    #                     if c.is_expired and c.status != "open":
-    #                         break
-    #         except asyncio.TimeoutError:
-    #             logger.error(f"⏱️ Timeout esperando expiración del contrato {br.contract_id}")
-    #             # Forzar consulta del estado final
-    #         except DerivConnectionError as e:
-    #             logger.error(f"🔌 Conexión perdida durante watch_contract: {e}")
-    #             await asyncio.sleep(5.0)  # Dar tiempo a que el ping_loop reconecte
-
-    #         # async for c in self._trading_client.watch_contract(
-    #         #     br.contract_id, 
-    #         #     stop_when_closed=False
-    #         # ):
-    #         #     if c.is_expired and c.status != "open":
-    #         #         break
-            
-    #         # 4. Obtener resultado final
-    #         contract: OpenContract | None = None
-    #         max_retries = 3
-
-    #         for attempt in range(max_retries):
-    #             try:
-    #                 contract = await self._trading_client.get_contract(br.contract_id)
-    #                 break  # Éxito, salimos del loop
-    #             except DerivConnectionError:
-    #                 if attempt < max_retries - 1:
-    #                     logger.warning(f"🔄 Retry {attempt + 1}/{max_retries} para obtener contrato")
-    #                     await asyncio.sleep(3.0)
-    #                 else:
-    #                     logger.error(f"❌ No se pudo obtener resultado del contrato {br.contract_id}")
-    #                     # Aquí decides: contar como loss, ignorar, o marcar como "unknown"
-    #                     return
-
-    #         if contract is None:
-    #             logger.error(f"❌ Contrato {br.contract_id} sin resultado definitivo")
-    #             return
-    #         # contract = await self._trading_client.get_contract(br.contract_id)
-            
-    #         # 5. Actualizar estado
-    #         result: TradeResult = 'win' if contract.profit > 0 else 'loss'
-    #         self.trade_results.append(result)
-    #         self.remaining_capital += contract.profit
-
-    #         # ==========================================================
-    #         # ACTUALIZAR CONTADOR DE LOSSES CONSECUTIVOS
-    #         # ==========================================================
-    #         if self._use_cooldown:
-    #             if result == 'loss':                
-    #                 self._consecutive_losses += 1
-    #                 logger.info(f"📉 Loss consecutivo #{self._consecutive_losses}")
-                    
-    #                 # Verificar si debemos activar cooldown
-    #                 if self._consecutive_losses >= self._cooldown_threshold:
-    #                     logger.warning(
-    #                         f"⚠️ {self._consecutive_losses} losses consecutivos detectados. "
-    #                         f"Activando cooldown de {self._cooldown_omissions} señales."
-    #                     )
-    #                     self._in_cooldown = True
-    #                     self._cooldown_signals_omitted = 0
-    #                     self._cooldown_until_epoch = None
-    #             else:
-    #                 # Resetear contador en caso de win
-    #                 if self._consecutive_losses > 0:
-    #                     logger.info(f"✅ Win detectado. Resetando contador de losses consecutivos.")
-    #                 self._consecutive_losses = 0
-
-    #         # ==========================================================
-    #         # 2. EVALUACIÓN DE EARLY EXIT (SOLUCIÓN A)
-    #         # ==========================================================
-    #         current_pnl = self.remaining_capital - self.initial_round_capital
-
-    #         # 2. Actualizar el máximo histórico de la ronda (Crucial para Solución B)
-    #         if current_pnl > self.max_round_pnl:
-    #             self.max_round_pnl = current_pnl
-
-    #         # 🔍 LOG DE DIAGNÓSTICO (Agrégalo temporalmente)
-    #         # ratio = (current_pnl / self.round_target_profit) if self.round_target_profit > 0 else 0.0
-    #         # logger.info(
-    #         #     f"🔍 DEBUG Early Exit -> PnL Actual: ${current_pnl:.2f} | "
-    #         #     f"Target PnL: ${self.round_target_profit:.2f} | "
-    #         #     f"Ratio: {ratio:.2f} | Threshold: {self.recovery_matrix_calculator.early_exit_threshold}"
-    #         # )
-            
-    #         logger.info(
-    #             f"✅ Trade completado: {result} | "
-    #             f"Profit: {contract.profit:.2f} | "
-    #             f"Capital restante: {self.remaining_capital:.2f}"
-    #         )
-
-    #         # ==========================================================
-    #         # EVALUACIÓN EN CASCADA DE PROTECCIÓN DE GANANCIAS
-    #         # ==========================================================
-            
-    #         # Solución A: Early Exit por Umbral            
-    #         if self.recovery_matrix_calculator.should_close_round_early(current_pnl, self.round_target_profit):
-    #             logger.info(
-    #                 f"🎯 Early Exit activado: PnL ${current_pnl:.2f} >= "
-    #                 f"{self.recovery_matrix_calculator.early_exit_threshold*100:.0f}% del target (${self.round_target_profit:.2f})"
-    #             )
-    #             # Finalizamos la ronda con éxito anticipado
-    #             await self._finalize_round("EARLY_EXIT_PROFIT_THRESHOLD")
-    #             # Iniciamos una nueva inmediatamente
-    #             await self._initialize_new_round()
-                
-    #             # IMPORTANTE: Salimos de la función. No guardamos en DB como trade normal 
-    #             # (o sí, dependiendo de tu preferencia, pero la ronda ya se cerró arriba).
-    #             return 
-
-    #         # Solución B: Trailing Stop de Ronda
-    #         if self.recovery_matrix_calculator.should_activate_trailing_stop(current_pnl, self.max_round_pnl):
-    #             logger.warning(
-    #                 f"📉 Trailing Stop Activado: PnL cayó de ${self.max_round_pnl:.2f} a ${current_pnl:.2f} "
-    #                 f"({((self.max_round_pnl - current_pnl)/self.max_round_pnl)*100:.1f}% de caída)"
-    #             )
-    #             await self._finalize_round("TRAILING_STOP_ACTIVATED")
-    #             await self._initialize_new_round()
-    #             return 
-            
-    #         # logger.info(
-    #         #     f"✅ Trade completado: {result} | "
-    #         #     f"Profit: {contract.profit:.2f} | "
-    #         #     f"Capital restante: {self.remaining_capital:.2f}"
-    #         # )
-            
-    #         # 6. Guardar en CouchDB (auditoría)
-    #         # await self._save_trade_to_db(contract, signal, bet, result)
-            
-    #         # 7. Verificar Take Profit / Stop Loss
-    #         balance = await self._trading_client.get_balance()
-    #         if balance.balance >= self.take_profit:
-    #             logger.info("🎯 Take Profit alcanzado")
-    #             self._is_running = False
-    #         elif balance.balance <= self.stop_loss:
-    #             logger.info("🛑 Stop Loss alcanzado")
-    #             self._is_running = False
-    #         elif balance.balance < 0.35:
-    #             logger.error("💸 Balance insuficiente")
-    #             self._is_running = False
-                
-    #     except DerivConnectionError as e:
-    #         logger.error(f"🔌 Error de conexión durante trade: {e}")
-    #         self._connection_failures += 1
-    #         # self._last_failure_time = datetime.utcnow()
-    #         self._last_failure_time = datetime.now(UTC)
-    #         # NO reiniciar la ronda, el trade no se ejecutó
-            
-    #     except DerivAPIError as e:
-    #         logger.error(f"❌ Error de API durante trade: {e}")
-    #         # Aquí puedes decidir si contar como loss o no
-    #         # Por seguridad, no contar si fue error de infraestructura
-            
-    #     except Exception as e:
-    #         logger.error(f"❌ Error inesperado en trade: {e}", exc_info=True)
 
     async def _execute_trade(self, signal: Signal, bet) -> None:
         """Ejecuta un trade y maneja la activación de cooldown si es necesario."""
@@ -921,32 +594,55 @@ class TradingEngine:
         except Exception as e:
             logger.error(f"❌ Error guardando trade en DB: {e}")
 
-    async def _load_initial_ticks(self, verbose: bool = False) -> None:
+    async def _load_initial_ticks(self, count: int = 3600, verbose: bool = False) -> None:
         """Carga histórico de ticks con manejo de errores."""
         try:
-            ticks_2, _ = await self._market_data_client.ticks_history(
-                symbol=self.symbol,
-                count=1000
-            )
-            ticks_1, _ = await self._market_data_client.ticks_history(
-                symbol=self.symbol,
-                count=1000,
-                end=ticks_2[0].epoch
-            )
+            all_ticks = []
+            if count > 1000:
+                batches = math.ceil(count / 1000)
+                end = "latest"
+                for i in range(batches):
+                    batch_size = min(1000, count - len(all_ticks))
+                    ts, _ = await self._market_data_client.ticks_history(symbol=self.symbol, count=batch_size, end=end)
+                    if not ts:
+                        break
+                    all_ticks = ts + all_ticks
+                    end = ts[0].epoch - 1
+                    await asyncio.sleep(0.1)                
+            else:
+                all_ticks, _ = await self._market_data_client.ticks_history(symbol=self.symbol, count=count)
+
+            self.ticks_buffer = sorted(all_ticks, key=lambda t: t.epoch)
             
-            # Combinar y ordenar
-            ticks = sorted(ticks_1 + ticks_2, key=lambda t: t.epoch)
-            ticks = list({t.epoch: t for t in ticks}.values())
+            if len(all_ticks) > 0 and verbose:
+                logger.info(f"✅ Cargados {len(all_ticks)} ticks históricos")
 
-            self._seconds_per_tick = ticks[-1].epoch - ticks[-2].epoch
-            self.ticks_buffer.clear()
-            self.ticks_buffer.extend(ticks)
-
-            if verbose:
-                logger.info(f"✅ Cargados {len(ticks)} ticks históricos")
-                
         except Exception as e:
-            logger.error(f"❌ Error cargando histórico: {e}", exc_info=True)
+            pass
+        # try:
+        #     ticks_2, _ = await self._market_data_client.ticks_history(
+        #         symbol=self.symbol,
+        #         count=1000
+        #     )
+        #     ticks_1, _ = await self._market_data_client.ticks_history(
+        #         symbol=self.symbol,
+        #         count=1000,
+        #         end=ticks_2[0].epoch
+        #     )
+            
+        #     # Combinar y ordenar
+        #     ticks = sorted(ticks_1 + ticks_2, key=lambda t: t.epoch)
+        #     ticks = list({t.epoch: t for t in ticks}.values())
+
+        #     self._seconds_per_tick = ticks[-1].epoch - ticks[-2].epoch
+        #     self.ticks_buffer.clear()
+        #     self.ticks_buffer.extend(ticks)
+
+        #     if verbose:
+        #         logger.info(f"✅ Cargados {len(ticks)} ticks históricos")
+                
+        # except Exception as e:
+        #     logger.error(f"❌ Error cargando histórico: {e}", exc_info=True)
 
     async def _ensure_active_round(self) -> bool:
         """

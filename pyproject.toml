@@ -19,7 +19,7 @@ dependencies = [
     "pydantic>=2.14.2",
     "pydantic-settings>=2.16.2",
     "numpy>=2.5.4",
-    "PyYAML>=6.0.3",
+    "pyyaml>=6.0.3",
     "derivpy@git+https://github.com/rloverab/derivpy.git@develop"
     # "CouchDB>=1.2", # O la librería que uses para CouchDB
     # "derivpy",    # Tu librería local o empaquetada

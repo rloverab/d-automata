@@ -62,6 +62,7 @@ class BacktestingEngine:
         stop_loss: Optional[float] = None,
         use_fixed_stake: bool = False,
         fixed_stake_amount: float = 1.0,
+        duration: int = 5,
         recovery_matrix_params: Optional[Dict] = None
     ):
         self.strategy = strategy
@@ -79,6 +80,9 @@ class BacktestingEngine:
         # Modo de Apuesta
         self.use_fixed_stake = use_fixed_stake
         self.fixed_stake_amount = fixed_stake_amount
+
+        # Duración de la operacion
+        self.duration = duration
 
         # Recovery Matrix Setup
         rm_params = recovery_matrix_params or {
@@ -255,7 +259,7 @@ class BacktestingEngine:
             buffer_slice = self.ticks_buffer[:i + 1]
 
             signal: Optional[Signal] = self.strategy.get_signal(
-                data=buffer_slice, duration=8
+                data=buffer_slice, duration=self.duration #8
             )
 
             if signal is None:
