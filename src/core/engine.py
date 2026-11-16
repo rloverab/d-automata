@@ -14,13 +14,13 @@ import logging
 from derivpy import MarketDataClient, OpenContract, Tick, TradingClient
 from derivpy.exceptions import DerivAPIError, DerivConnectionError
 import numpy as np
-from backtest.engine import BacktestingEngine
 from config.filters_config import load_filters_config
 from config.strategies_config import load_strategies_config
 from core.models import Signal
 from filters.volatility_regime_filter_v2 import VolatilityRegimeFilterV2
+from optimizer.duration_optimizer import DurationOptimizer
 from strategies.momentum_pullback_velocity_strategy import MomentumPullbackVelocityStrategy
-from risk.recovery_matrix_calculator import RecoveryMatrixCalculator, TradeResult
+from risk.recovery_calculator_closed_form import RecoveryCalculatorClosedForm as calc_bet, TradeResult
 from config.config import settings
 
 logger = logging.getLogger(__name__)
@@ -44,21 +44,7 @@ class TradingEngine:
         self.ticks_buffer = deque(maxlen=3600)
         self.tick_queue = asyncio.Queue(maxsize=100)  # Cola para procesamiento
         
-        # Estrategia y filtros
-        # self.strategy = MarkovRegimeStrategy(
-        #     target_horizon=5,
-        #     prob_threshold=0.25
-        # )
-        # self.strategy = RiseFallMontecarloStrategy(
-        #     simulations=5000,
-        #     threshold=0.51
-        # )
-        # self.strategy = RiseFallMontecarloStrategy(strategy_params.rise_fall_montecarlo)
-        # self.filter: Filter | None = VolatilityFilter(
-        #     lookback=200
-        # )
-        # self.strategy = ExperimentalStrategy()
-        # self.strategy = MomentumPullbackAdaptiveStrategy()
+        # Estrategia y filtros        
         self.strategy = MomentumPullbackVelocityStrategy(
             impulse_ticks=1, #3,
             min_velocity_ratio=1.1 #1.25
@@ -68,54 +54,33 @@ class TradingEngine:
             # VolatilityFilter(filters_params.volatility),
             # SpreadTrendFilter()
 
-            VolatilityRegimeFilterV2(
-                # min_efficiency=0.30,
-                spike_multiplier=2.5,
-                window=30
-            )
+            # VolatilityRegimeFilterV2(
+            #     # min_efficiency=0.30,
+            #     spike_multiplier=2.5,
+            #     window=30
+            # )
 
             # VolatilityRegimeFilter(min_efficiency=0.30)
         ]
-        self.duration = 8
-
-        self.backtest = BacktestingEngine(
-            strategy=self.strategy,
-            filters=self.filters,
-            max_concurrent_trades=1,
-            initial_capital=40.0,
-            round_allocation=15.0,
-            take_profit=1000.0,
-            stop_loss=0.0,
-            use_fixed_stake=False,
-            fixed_stake_amount=1.0,
-            recovery_matrix_params={
-                "payout_pct": 91.5,
-                "max_trades": 2,
-                "target_wins": 1,
-                "use_early_exit": False,
-                "early_exit_threshold": 0.9,
-                "use_trailing_stop": False,
-                "trailing_stop_pct": 0.40
-            }
-        )
+        self.duration = 0
         
         # Gestión de capital
-        self.recovery_matrix_calculator = RecoveryMatrixCalculator(
-            payout_pct=91.5, max_trades=2, target_wins=1,
-            use_early_exit=False,
-            early_exit_threshold=0.70, # Default            
-            # early_exit_threshold=0.638, # Default            
-            # early_exit_threshold=0.344, # Emular comportamiento previo errado
-            use_trailing_stop=False,
-            trailing_stop_pct=0.40,           # Corta si cae 40% desde el máximo
-            use_min_viability=False,           # Activa C
-            min_viability_pct=0.10            # No arriesga si el trade es < 10% del capital restante
-        )
-        self.trade_results: list[TradeResult] = []
+        self.payout_pct = 91.5
+        self.max_trades = 5
+        self.target_wins = 1
+        self.min_bet = 0.35
+        self.trade_results = deque(maxlen=self.max_trades)        
         self.capital: float = 15.0
         self.remaining_capital: float = self.capital
         self.take_profit: float = 10100.0  # TODO: Mover a config
         self.stop_loss: float = 9960.0     # TODO: Mover a config
+
+        # ✅ AGREGAR: Parámetros de protección (antes estaban en la instancia)
+        self.use_early_exit = False
+        self.early_exit_threshold = 0.70
+        self.use_trailing_stop = False
+        self.trailing_stop_pct = 0.50
+        self.round_target_profit: float = 0.0
         
         # Estado
         self.last_update: Optional[Tick] = None
@@ -140,6 +105,24 @@ class TradingEngine:
         self._cooldown_signals_omitted = 0
         self._cooldown_until_epoch: Optional[float] = None  # Epoch hasta el cual simulamos señal
         self._seconds_per_tick = 0.0
+
+        # ✅ NUEVO: Optimizador de duración
+        self.duration_optimizer = DurationOptimizer(
+            strategy=self.strategy,
+            filters=self.filters,
+            duration_range=range(1, 11),
+            min_win_rate=0.60,
+            max_trades_per_round=self.max_trades,
+            payout_pct=self.payout_pct,
+            min_sample_size=5,
+            hysteresis_margin=0.10
+        )
+        
+        # Configuración del optimizador
+        self._optimizer_enabled = True
+        self._optimizer_interval_seconds = 150 #300  # Cada 5 minutos
+        self._optimizer_task: Optional[asyncio.Task] = None
+        self._last_optimizer_run: float = 0
 
     async def start(self) -> None:
         """Inicia el motor con arquitectura producer-consumer."""
@@ -169,16 +152,24 @@ class TradingEngine:
             
             # Consumer: Procesa señales y ejecuta trades
             consumer_task = asyncio.create_task(self._signal_consumer())
+
+            # ✅ NUEVO: Tarea de optimización en background
+            if self._optimizer_enabled:
+                self._optimizer_task = asyncio.create_task(self._duration_optimizer_loop())
             
             # Esperar a que ambas terminen (o fallen)
-            await asyncio.gather(producer_task, consumer_task)
+            tasks = [producer_task, consumer_task]
+            if self._optimizer_task:
+                tasks.append(self._optimizer_task)
+            
+            await asyncio.gather(*tasks)
             
         except asyncio.CancelledError:
             logger.info("⏹️ Motor detenido de forma segura")
         except Exception as e:
             logger.error(f"❌ Error crítico en el motor: {e}", exc_info=True)
         finally:
-            await self.stop()
+            await self.stop()    
 
     async def _tick_producer(self) -> None:
         """
@@ -283,6 +274,11 @@ class TradingEngine:
                 
                 # 3. Obtener señal
                 signals_attempted += 1
+
+                # 3.5. Verificar la duración
+                if self.duration == 0:
+                    continue
+
                 signal = self.strategy.get_signal(
                     data=list(self.ticks_buffer),
                     duration=self.duration
@@ -324,10 +320,13 @@ class TradingEngine:
                     )
                     continue
                 
-                # 6. Calcular monto
-                bet = self.recovery_matrix_calculator.calculate_next_bet(
-                    self.trade_results,
-                    self.remaining_capital
+                # 6. Calcular monto                
+                bet = calc_bet.calculate_next_bet(
+                    history=list(self.trade_results),
+                    current_round_capital=self.remaining_capital,
+                    payout_pct=self.payout_pct,
+                    max_trades=self.max_trades,
+                    target_wins=self.target_wins
                 )
                 
                 # 7. Ejecutar trade
@@ -385,17 +384,12 @@ class TradingEngine:
         if not self._trading_client.is_connected:
             logger.warning("⚠️ Cliente desconectado, omitiendo trade")
             return False
-
-        # Experimental        
-        # random_number = randint(1, 100)
-        # if random_number <= 60:
-        #     return False
         
         # 2. Verificar capital mínimo de la ronda
-        if self.remaining_capital < self.recovery_matrix_calculator.min_bet:
+        if self.remaining_capital < self.min_bet:
             logger.warning(
                 f"⚠️ Capital de ronda insuficiente: {self.remaining_capital:.2f} < "
-                f"{self.recovery_matrix_calculator.min_bet}"
+                f"{self.min_bet}"
             )
             return False
         
@@ -506,17 +500,30 @@ class TradingEngine:
             )
 
             # Evaluación de Early Exit
-            if self.recovery_matrix_calculator.should_close_round_early(current_pnl, self.round_target_profit):
-                logger.info(
-                    f"🎯 Early Exit activado: PnL ${current_pnl:.2f} >= "
-                    f"{self.recovery_matrix_calculator.early_exit_threshold*100:.0f}% del target"
-                )
-                await self._finalize_round("EARLY_EXIT_PROFIT_THRESHOLD")
-                await self._initialize_new_round()
-                return 
+            if self.use_early_exit:
+                if calc_bet.should_close_round_early(
+                    current_pnl, 
+                    self.round_target_profit,
+                    self.early_exit_threshold  # ← Usar atributo del engine
+                ):
+                    logger.info(
+                        f"🎯 Early Exit activado: PnL ${current_pnl:.2f} >= "
+                        f"{self.early_exit_threshold*100:.0f}% del target"  # ← CORREGIDO
+                    )
+                    await self._finalize_round("EARLY_EXIT_PROFIT_THRESHOLD")
+                    await self._initialize_new_round()
+                    return
+            # if calc_bet.should_close_round_early(current_pnl, self.round_target_profit):
+            #     logger.info(
+            #         f"🎯 Early Exit activado: PnL ${current_pnl:.2f} >= "
+            #         f"{self.recovery_matrix_calculator.early_exit_threshold*100:.0f}% del target"
+            #     )
+            #     await self._finalize_round("EARLY_EXIT_PROFIT_THRESHOLD")
+            #     await self._initialize_new_round()
+            #     return 
 
             # Trailing Stop
-            if self.recovery_matrix_calculator.should_activate_trailing_stop(current_pnl, self.max_round_pnl):
+            if calc_bet.should_activate_trailing_stop(current_pnl, self.max_round_pnl):
                 logger.warning(
                     f"📉 Trailing Stop Activado: PnL cayó de ${self.max_round_pnl:.2f} a ${current_pnl:.2f}"
                 )
@@ -612,37 +619,15 @@ class TradingEngine:
             else:
                 all_ticks, _ = await self._market_data_client.ticks_history(symbol=self.symbol, count=count)
 
-            self.ticks_buffer = sorted(all_ticks, key=lambda t: t.epoch)
+            sorted_ticks = sorted(all_ticks, key=lambda t: t.epoch)
+            self.ticks_buffer.clear()
+            self.ticks_buffer.extend(sorted_ticks)
             
             if len(all_ticks) > 0 and verbose:
                 logger.info(f"✅ Cargados {len(all_ticks)} ticks históricos")
 
         except Exception as e:
-            pass
-        # try:
-        #     ticks_2, _ = await self._market_data_client.ticks_history(
-        #         symbol=self.symbol,
-        #         count=1000
-        #     )
-        #     ticks_1, _ = await self._market_data_client.ticks_history(
-        #         symbol=self.symbol,
-        #         count=1000,
-        #         end=ticks_2[0].epoch
-        #     )
-            
-        #     # Combinar y ordenar
-        #     ticks = sorted(ticks_1 + ticks_2, key=lambda t: t.epoch)
-        #     ticks = list({t.epoch: t for t in ticks}.values())
-
-        #     self._seconds_per_tick = ticks[-1].epoch - ticks[-2].epoch
-        #     self.ticks_buffer.clear()
-        #     self.ticks_buffer.extend(ticks)
-
-        #     if verbose:
-        #         logger.info(f"✅ Cargados {len(ticks)} ticks históricos")
-                
-        # except Exception as e:
-        #     logger.error(f"❌ Error cargando histórico: {e}", exc_info=True)
+            pass        
 
     async def _ensure_active_round(self) -> bool:
         """
@@ -651,9 +636,12 @@ class TradingEngine:
         Retorna True si se puede operar, False si el motor debe detenerse globalmente.
         """
         # 1. Verificar el estado matemático de la ronda actual
-        bet_info = self.recovery_matrix_calculator.calculate_next_bet(
-            self.trade_results, 
-            self.remaining_capital
+        bet_info = calc_bet.calculate_next_bet(
+            history=list(self.trade_results),
+            current_round_capital=self.remaining_capital,
+            payout_pct=self.payout_pct,
+            max_trades=self.max_trades,
+            target_wins=self.target_wins
         )
 
         # 2. Si la ronda NO está activa (por losses, max trades, o capital insuficiente)
@@ -665,11 +653,6 @@ class TradingEngine:
             
             # Finalizar y registrar la ronda antes de resetear
             await self._finalize_round(bet_info["status"])
-
-            # Experimental: Reiniciar conexion en TradingClient si se pierde una ronda
-            await self._trading_client.disconnect()
-            await asyncio.sleep(2.0)
-            await self._trading_client.connect()
             
             # Intentar iniciar una nueva ronda
             can_continue = await self._initialize_new_round()
@@ -677,9 +660,12 @@ class TradingEngine:
                 return False # El balance global no permite seguir
 
         # 3. Verificación final de seguridad (doble check)
-        final_bet_info = self.recovery_matrix_calculator.calculate_next_bet(
-            self.trade_results, 
-            self.remaining_capital
+        final_bet_info = calc_bet.calculate_next_bet(
+            history=list(self.trade_results),
+            current_round_capital=self.remaining_capital,
+            payout_pct=self.payout_pct,
+            max_trades=self.max_trades,
+            target_wins=self.target_wins
         )
         
         if final_bet_info["status"] != "ACTIVE":
@@ -709,7 +695,8 @@ class TradingEngine:
                 self._is_running = False
                 return False
                 
-            if current_total_balance < self.recovery_matrix_calculator.min_bet:
+            # if current_total_balance < self.recovery_matrix_calculator.min_bet:
+            if current_total_balance < self.min_bet:
                 logger.critical(f"💀 BALANCE CRÍTICO. Insuficiente para el trade mínimo ({current_total_balance} < 0.35)")
                 self._is_running = False
                 return False
@@ -723,14 +710,17 @@ class TradingEngine:
             self.initial_round_capital = new_round_capital
 
             self.remaining_capital = new_round_capital
-            self.trade_results = [] # Resetear historial de la ronda
+            self.trade_results.clear() # Resetear historial de la ronda
 
             # Resetear el máximo de la nueva ronda
             self.max_round_pnl = 0.0  # <-- NUEVO
 
             # 2. Calcular el target de la ronda completa basado en matrix[0, 0]
-            self.round_target_profit = self.recovery_matrix_calculator.get_round_target_profit(
-                self.initial_round_capital
+            self.round_target_profit = calc_bet.get_round_target_profit(
+                initial_round_capital=self.initial_round_capital,
+                payout_pct=self.payout_pct,
+                max_trades=self.max_trades,
+                target_wins=self.target_wins
             )
 
             # Log de diagnóstico
@@ -738,15 +728,9 @@ class TradingEngine:
                 f"✅ Nueva ronda iniciada. "
                 f"Capital asignado: ${self.remaining_capital:.2f} | "
                 f"Target PnL: ${self.round_target_profit:.2f} | "
-                f"Matrix[0,0]: {self.recovery_matrix_calculator.matrix[0, 0]:.4f} | "
                 f"(Balance Total: ${current_total_balance:.2f})"
             )
             
-            # DEPRECATED: 2. Estimar el target de la ronda (Payout esperado del primer trade)
-            # first_bet_info = self.recovery_matrix_calculator.calculate_next_bet([], self.initial_round_capital)
-            # self.round_target_profit = first_bet_info['next_bet'] * self.recovery_matrix_calculator.payout            
-            # logger.info(f"✅ Nueva ronda iniciada. Capital asignado: ${self.remaining_capital:.2f} (Balance Total: ${current_total_balance:.2f})")
-
             return True
             
         except Exception as e:
@@ -759,7 +743,9 @@ class TradingEngine:
         """
         wins = sum(1 for r in self.trade_results if r == 'win')
         losses = sum(1 for r in self.trade_results if r == 'loss')
-        net_round_profit = self.remaining_capital - self.capital # Aproximación si no se recargó aún
+        # net_round_profit = self.remaining_capital - self.capital # Aproximación si no se recargó aún
+        # ✅ CORRECCIÓN: Usar initial_round_capital en lugar de capital fijo
+        net_round_profit = self.remaining_capital - self.initial_round_capital
         
         round_doc = {
             "type": "round_summary",
@@ -781,11 +767,88 @@ class TradingEngine:
         except Exception as e:
             logger.error(f"Error guardando ronda en DB: {e}")
 
+    async def _duration_optimizer_loop(self) -> None:
+        """
+        Tarea en background que ejecuta el optimizador periódicamente.
+        NO interfiere con producer/consumer porque usa copias del buffer.
+        """
+        logger.info(f"🔬 Optimizador de duración iniciado | Intervalo: {self._optimizer_interval_seconds}s")
+        
+        # Esperar inicial antes de primera optimización
+        await asyncio.sleep(60)
+        
+        while self._is_running:
+            try:
+                # Verificar intervalo
+                current_time = asyncio.get_event_loop().time()
+                if current_time - self._last_optimizer_run < self._optimizer_interval_seconds:
+                    await asyncio.sleep(10)
+                    continue
+                
+                self._last_optimizer_run = current_time
+                
+                # ✅ CRÍTICO: Copiar buffer para evitar race conditions
+                ticks_copy = list(self.ticks_buffer)
+                
+                if len(ticks_copy) < 500:
+                    logger.debug("⏸️ Buffer insuficiente para optimización")
+                    await asyncio.sleep(30)
+                    continue
+                
+                # Ejecutar optimización (puede tomar varios segundos)
+                new_duration = await self.duration_optimizer.optimize(
+                    ticks_buffer=ticks_copy,
+                    current_duration=self.duration
+                )
+                
+                # Actualizar duración si cambió
+                if new_duration is not None and new_duration != self.duration:
+                    old_duration = self.duration
+                    self.duration = new_duration
+                    logger.info(
+                        f"🔄 DURACIÓN ACTUALIZADA: {old_duration} → {new_duration}"
+                    )
+                    
+                    # Opcional: Guardar en CouchDB para auditoría
+                    await self._save_duration_change(old_duration, new_duration)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"❌ Error en optimizador de duración: {e}", exc_info=True)
+                await asyncio.sleep(30)
+        
+        logger.info("🔬 Optimizador de duración detenido")
+
+    async def _save_duration_change(self, old_duration: int, new_duration: int) -> None:
+        """Guarda cambio de duración en CouchDB para auditoría."""
+        try:
+            doc = {
+                "type": "duration_change",
+                "timestamp": datetime.now(UTC).isoformat(),
+                "symbol": self.symbol,
+                "old_duration": old_duration,
+                "new_duration": new_duration,
+                "optimizer_summary": self.duration_optimizer.get_recommendation_summary()
+            }
+            # await self.db.save(doc)
+            logger.debug(f"💾 Cambio de duración registrado: {doc}")
+        except Exception as e:
+            logger.error(f"Error guardando cambio de duración: {e}")
+
     async def stop(self) -> None:
         """Detiene el motor y limpia recursos."""
         if self._is_running:
             self._is_running = False
             logger.info("⏹️ Deteniendo TradingEngine...")
+
+            # ✅ Cancelar tarea de optimización
+            if self._optimizer_task and not self._optimizer_task.done():
+                self._optimizer_task.cancel()
+                try:
+                    await self._optimizer_task
+                except asyncio.CancelledError:
+                    pass
             
             # Esperar a que los trades activos terminen (con timeout)
             if self._active_trades:
@@ -851,10 +914,8 @@ class TradingEngine:
         min_threshold = 0.51
         if min_threshold <= (len_call_signals / total) <= max_threshold:
             return call_signals[-1]
-            # return put_signals[-1]        
         if min_threshold <= (len_put_signals / total) <= max_threshold:
             return put_signals[-1]
-            # return call_signals[-1]
                 
         return None
 

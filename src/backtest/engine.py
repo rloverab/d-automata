@@ -15,6 +15,7 @@ from core.models import Signal
 from filters.base import Filter
 from filters.volatility_regime_filter_v2 import VolatilityRegimeFilterV2
 from risk.recovery_matrix_calculator import RecoveryMatrixCalculator
+from risk.recovery_calculator_closed_form import RecoveryCalculatorClosedForm as calc_bet
 
 logger = logging.getLogger(__name__)
 
@@ -55,11 +56,18 @@ class BacktestingEngine:
         strategy,
         filters: List[Filter],
         max_concurrent_trades: int = 1,
-        payout_pct: float = 0.905,
+        payout_pct: float = 91.2,
         initial_capital: float = 100.0,
         round_allocation: float = 15.0,
         take_profit: Optional[float] = None,
         stop_loss: Optional[float] = None,
+        max_trades: int = 5,
+        target_wins: int = 1,
+        min_bet: float = 0.35,
+        use_early_exit: bool = False,
+        early_exit_threshold: float = 0.70,
+        use_trailing_stop: bool = False,
+        trailing_stop_pct: float = 0.50,
         use_fixed_stake: bool = False,
         fixed_stake_amount: float = 1.0,
         duration: int = 5,
@@ -68,6 +76,19 @@ class BacktestingEngine:
         self.strategy = strategy
         self.filters = filters
         self.max_concurrent_trades = max_concurrent_trades
+
+        # Validación de consistencia
+        if payout_pct < 1:
+            logger.warning(
+                f"⚠️ payout_pct={payout_pct} parece estar en formato decimal. "
+                f"Convirtiendo a porcentaje (×100)"
+            )
+            payout_pct = payout_pct * 100
+        
+        if payout_pct > 100:
+            logger.error(f"❌ payout_pct={payout_pct} es mayor a 100%. Revisa la configuración.")
+            raise ValueError("payout_pct debe estar entre 1 y 100")
+        
         self.payout_pct = payout_pct
 
         # Configuración de Capital
@@ -76,6 +97,17 @@ class BacktestingEngine:
         self.round_allocation = round_allocation
         self.take_profit = take_profit
         self.stop_loss = stop_loss
+
+        # Configuración de Matriz
+        self.max_trades = max_trades
+        self.target_wins = target_wins
+        self.min_bet = min_bet
+        
+        # Protección de ganancias
+        self.use_early_exit = use_early_exit
+        self.early_exit_threshold = early_exit_threshold
+        self.use_trailing_stop = use_trailing_stop
+        self.trailing_stop_pct = trailing_stop_pct
 
         # Modo de Apuesta
         self.use_fixed_stake = use_fixed_stake
@@ -163,7 +195,13 @@ class BacktestingEngine:
 
         # Alineación con TradingEngine._initialize_new_round
         self.initial_round_capital = allocation
-        self.round_target_profit = self.recovery_calculator.get_round_target_profit(allocation)
+        # self.round_target_profit = self.recovery_calculator.get_round_target_profit(allocation)
+        self.round_target_profit = calc_bet.get_round_target_profit(
+            initial_round_capital=allocation,
+            payout_pct=self.payout_pct,
+            max_trades=self.max_trades,
+            target_wins=self.target_wins
+        )
         self.max_round_pnl = 0.0
 
         logger.debug(
@@ -190,10 +228,27 @@ class BacktestingEngine:
         if self.use_fixed_stake:
             stake = self.fixed_stake_amount
         else:
-            bet_info = self.recovery_calculator.calculate_next_bet(
-                self.round_trade_results,
-                self.remaining_round_capital
+            # bet_info = self.recovery_calculator.calculate_next_bet(
+            #     self.round_trade_results,
+            #     self.remaining_round_capital
+            # )
+            bet_info = calc_bet.calculate_next_bet(
+                history=self.round_trade_results,
+                current_round_capital=self.remaining_round_capital,
+                payout_pct=self.payout_pct,
+                max_trades=self.max_trades,
+                target_wins=self.target_wins,
+                min_bet=self.min_bet
             )
+
+            # ✅ LOG DE DEBUGGING
+            logger.info(
+                f"💰 Stake calc | Round capital: ${self.remaining_round_capital:.2f} | "
+                f"History: {self.round_trade_results} | "
+                f"Next bet: ${bet_info.get('next_bet', 0):.2f} | "
+                f"Status: {bet_info.get('status')}"
+            )
+            
             if bet_info["status"] != "ACTIVE":
                 return None
             stake = bet_info["next_bet"]
@@ -240,8 +295,13 @@ class BacktestingEngine:
 
             # 2. Verificar estado de ronda ANTES de buscar señal
             # Equivalente a TradingEngine._ensure_active_round()
-            bet_check = self.recovery_calculator.calculate_next_bet(
-                self.round_trade_results, self.remaining_round_capital
+            bet_check = calc_bet.calculate_next_bet(
+                history=self.round_trade_results,
+                current_round_capital=self.remaining_round_capital,
+                payout_pct=self.payout_pct,
+                max_trades=self.max_trades,
+                target_wins=self.target_wins,
+                min_bet=self.min_bet
             )
             if bet_check["status"] != "ACTIVE":
                 self._finalize_round(reason=bet_check["status"])
@@ -337,14 +397,15 @@ class BacktestingEngine:
 
                 # Contabilidad limpia: sin doble conteo
                 if is_win:
-                    profit = stake * self.payout_pct
+                    profit = stake * round(self.payout_pct / 100.0, 2)
                     pnl = profit
+                    self.remaining_round_capital += stake + profit
                 else:
                     profit = 0.0
                     pnl = -stake
 
                 self.current_balance += pnl
-                self.remaining_round_capital += stake + pnl  # Devolver stake al pool + resultado
+                # self.remaining_round_capital += stake + pnl  # Devolver stake al pool + resultado
 
                 result_str = 'win' if is_win else 'loss'
                 self.round_trade_results.append(result_str)
@@ -378,10 +439,14 @@ class BacktestingEngine:
                 )
 
                 # Evaluar cierre temprano de ronda (Early Exit + Trailing Stop)
-                close_decision = self.recovery_calculator.should_close_round(
+                close_decision = calc_bet.should_close_round(
                     current_pnl=current_round_pnl,
                     target_profit=self.round_target_profit,
-                    max_pnl=self.max_round_pnl
+                    max_pnl=self.max_round_pnl,
+                    use_early_exit=self.use_early_exit,
+                    early_exit_threshold=self.early_exit_threshold,
+                    use_trailing_stop=self.use_trailing_stop,
+                    trailing_stop_pct=self.trailing_stop_pct
                 )
 
                 if close_decision["close"]:
@@ -513,29 +578,47 @@ async def main():
         ),
     ]
 
-    engine = BacktestingEngine(
-        strategy=strategy,
-        filters=filters,
-        max_concurrent_trades=1,
-        initial_capital=40.0,
-        round_allocation=15.0,
-        take_profit=1000.0,
-        stop_loss=0.0,
-        use_fixed_stake=False,
-        fixed_stake_amount=1.0,
-        recovery_matrix_params={
-            "payout_pct": 90,
-            "max_trades": 2,
-            "target_wins": 1,
-            "use_early_exit": False,
-            "early_exit_threshold": 0.9,
-            "use_trailing_stop": False,
-            "trailing_stop_pct": 0.40
-        }
-    )
+    for duration in range(1,11):
+        engine = BacktestingEngine(
+            strategy=strategy,
+            filters=filters,
+            max_concurrent_trades=1,
+            initial_capital=40.0,
+            round_allocation=20.0,
+            take_profit=100.0,
+            stop_loss=0.0,
+            max_trades=3,
+            target_wins=1,
+            min_bet=0.35,
+            use_fixed_stake=False,
+            fixed_stake_amount=1.0,
+            duration=duration,
+            recovery_matrix_params={
+                "payout_pct": 90,
+                "max_trades": 2,
+                "target_wins": 1,
+                "use_early_exit": False,
+                "early_exit_threshold": 0.9,
+                "use_trailing_stop": False,
+                "trailing_stop_pct": 0.40
+            }
+        )
 
-    await engine.load_ticks("1HZ100V", int(12*3600/1))
-    report = engine.run()
+        await engine.load_ticks("1HZ100V", 3600)
+        print(f"----- Duration: {duration} -----")
+        report = engine.run()
+
+    # from risk.recovery_calculator_closed_form import RecoveryCalculatorClosedForm as rccf
+    # result = ["loss", "loss", "loss", "loss", "win"]
+    # capital = 20.0
+    # for i in range(0,6):
+    #     history = result[0:i]
+    #     if len(history)>0:
+    #         capital += round(t["next_bet"]*0.9 if history[-1] == "win" else -t["next_bet"],2)
+    #     t = rccf.calculate_next_bet(history=history, current_round_capital=capital, payout_pct=90.0, max_trades=5, target_wins=1)        
+    #     print(t)
+    #     print(f"Retorno: {capital}")
+    # print(capital)
 
     # Opcional: Guardar en CouchDB
     # db.save({"type": "backtest_report", "timestamp": datetime.utcnow().isoformat(), **report})
