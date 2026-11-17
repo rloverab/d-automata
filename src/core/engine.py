@@ -22,15 +22,13 @@ from optimizer.duration_optimizer import DurationOptimizer
 from strategies.momentum_pullback_velocity_strategy import MomentumPullbackVelocityStrategy
 from risk.recovery_calculator_closed_form import RecoveryCalculatorClosedForm as calc_bet, TradeResult
 from config.config import settings
+from strategies.packs_strategy import VolatilitySqueezeConfig, VolatilitySqueezeStrategy, ZScoreReversionConfig, ZScoreReversionStrategy
 
 logger = logging.getLogger(__name__)
 
 
 class TradingEngine:
     def __init__(self, account_id: str, symbol: str):
-        strategy_params = load_strategies_config()
-        filters_params = load_filters_config()
-
         self._is_running = False
         self._market_data_client = MarketDataClient()
         self._trading_client = TradingClient(
@@ -45,10 +43,12 @@ class TradingEngine:
         self.tick_queue = asyncio.Queue(maxsize=100)  # Cola para procesamiento
         
         # Estrategia y filtros        
-        self.strategy = MomentumPullbackVelocityStrategy(
-            impulse_ticks=1, #3,
-            min_velocity_ratio=1.1 #1.25
-        )
+        # self.strategy = MomentumPullbackVelocityStrategy(
+        #     impulse_ticks=1, #3,
+        #     min_velocity_ratio=1.1 #1.25
+        # )
+        # self.strategy = ZScoreReversionStrategy(ZScoreReversionConfig())
+        self.strategy = VolatilitySqueezeStrategy(VolatilitySqueezeConfig())
         # self.strategy = MomentumPullbackFive()
         self.filters = [
             # VolatilityFilter(filters_params.volatility),
@@ -66,11 +66,11 @@ class TradingEngine:
         
         # Gestión de capital
         self.payout_pct = 91.5
-        self.max_trades = 5
+        self.max_trades = 2
         self.target_wins = 1
         self.min_bet = 0.35
         self.trade_results = deque(maxlen=self.max_trades)        
-        self.capital: float = 15.0
+        self.capital: float = 20.0
         self.remaining_capital: float = self.capital
         self.take_profit: float = 10100.0  # TODO: Mover a config
         self.stop_loss: float = 9960.0     # TODO: Mover a config
@@ -111,16 +111,16 @@ class TradingEngine:
             strategy=self.strategy,
             filters=self.filters,
             duration_range=range(1, 11),
-            min_win_rate=0.60,
+            min_win_rate=0.55,
             max_trades_per_round=self.max_trades,
             payout_pct=self.payout_pct,
             min_sample_size=5,
-            hysteresis_margin=0.10
+            hysteresis_margin=0.025#0.10
         )
         
         # Configuración del optimizador
         self._optimizer_enabled = True
-        self._optimizer_interval_seconds = 150 #300  # Cada 5 minutos
+        self._optimizer_interval_seconds = 180 #300  # Cada 5 minutos
         self._optimizer_task: Optional[asyncio.Task] = None
         self._last_optimizer_run: float = 0
 
@@ -423,7 +423,7 @@ class TradingEngine:
             )
 
             # LOG Temporal
-            print(json.dumps(signal.extras,indent=4))
+            # print(json.dumps(signal.extras,indent=4))
             
             # Esperar expiración del contrato
             max_wait = signal.duration * 2 + 30

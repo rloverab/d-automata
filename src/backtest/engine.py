@@ -563,12 +563,36 @@ async def main():
 
     # Importar estrategia y filtros según necesidad
     from strategies.momentum_pullback_velocity_strategy import MomentumPullbackVelocityStrategy
+    from strategies.packs_strategy import ZScoreReversionStrategy, ZScoreReversionConfig
+    from strategies.packs_strategy import VolatilitySqueezeStrategy, VolatilitySqueezeConfig
+    from strategies.packs_strategy import TickImbalanceStrategy, TickImbalanceConfig
+    from strategies.packs_strategy import ShannonEntropyStrategy, ShannonEntropyConfig
     # from filters.volatility_regime_filter_v2 import VolatilityRegimeFilterV2
 
-    strategy = MomentumPullbackVelocityStrategy(
-        impulse_ticks=1,
-        min_velocity_ratio=1.1
-    )
+    # strategy = MomentumPullbackVelocityStrategy(
+    #     impulse_ticks=1,
+    #     min_velocity_ratio=1.1
+    # )
+
+    # =====================================================================
+    # 1. REVERSIÓN POR AGOTAMIENTO DE RACHA (Z-Score + Desaceleración)
+    # =====================================================================
+    # strategy = ZScoreReversionStrategy(ZScoreReversionConfig())
+
+    # =====================================================================
+    # 2. RUPTURA DE COMPRESIÓN DE VOLATILIDAD (Squeeze Breakout)
+    # =====================================================================
+    strategy = VolatilitySqueezeStrategy(VolatilitySqueezeConfig())
+
+    # =====================================================================
+    # 3. ASIMETRÍA DE MICRO-VELAS (Tick Imbalance & Absorción)
+    # =====================================================================
+    # strategy = TickImbalanceStrategy(TickImbalanceConfig())
+
+    # =====================================================================
+    # 4. FILTRO DE ENTROPÍA DE SHANNON (Regímenes Deterministas)
+    # =====================================================================
+    # strategy = ShannonEntropyStrategy(ShannonEntropyConfig())
 
     filters = [
         VolatilityRegimeFilterV2(
@@ -577,6 +601,8 @@ async def main():
             window=30
         ),
     ]
+
+    ticks: list[Tick] = []
 
     for duration in range(1,11):
         engine = BacktestingEngine(
@@ -587,24 +613,29 @@ async def main():
             round_allocation=20.0,
             take_profit=100.0,
             stop_loss=0.0,
-            max_trades=3,
+            max_trades=2,
             target_wins=1,
             min_bet=0.35,
             use_fixed_stake=False,
             fixed_stake_amount=1.0,
             duration=duration,
-            recovery_matrix_params={
-                "payout_pct": 90,
-                "max_trades": 2,
-                "target_wins": 1,
-                "use_early_exit": False,
-                "early_exit_threshold": 0.9,
-                "use_trailing_stop": False,
-                "trailing_stop_pct": 0.40
-            }
+            # recovery_matrix_params={
+            #     "payout_pct": 90,
+            #     "max_trades": 2,
+            #     "target_wins": 1,
+            #     "use_early_exit": False,
+            #     "early_exit_threshold": 0.9,
+            #     "use_trailing_stop": False,
+            #     "trailing_stop_pct": 0.40
+            # }
         )
+        
+        if len(ticks) == 0:
+            await engine.load_ticks("1HZ100V", 1*3600)
+            ticks = engine.ticks_buffer
+        else:
+            engine.ticks_buffer = ticks
 
-        await engine.load_ticks("1HZ100V", 3600)
         print(f"----- Duration: {duration} -----")
         report = engine.run()
 

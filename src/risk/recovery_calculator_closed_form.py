@@ -1,45 +1,19 @@
 """
-Calculadora de Recuperación usando Matriz Precomputada
-Arquitectura: Clase estática con caché de matrices
+Calculadora de Recuperación en Forma Cerrada (Closed-Form)
+Arquitectura: Clase estática (sin estado) para máxima eficiencia
 """
 
-import numpy as np
+import math
 from typing import List, Literal, Dict, Union
-from functools import lru_cache
 
 TradeResult = Literal['win', 'loss', 'draw']
 
 
 class RecoveryCalculatorClosedForm:
     """
-    Calculadora de gestión de recuperación usando matriz precomputada.
-    Todos los métodos son estáticos. Las matrices se cachean para eficiencia.
+    Calculadora de gestión de recuperación usando fórmulas cerradas.
+    Todos los métodos son estáticos para evitar overhead de instanciación.
     """
-
-    @staticmethod
-    @lru_cache(maxsize=128)
-    def _build_matrix(payout_pct: float, max_trades: int, target_wins: int) -> np.ndarray:
-        """Construye y cachea la matriz de recuperación."""
-        n = max_trades
-        e = target_wins
-        profit = payout_pct / 100.0
-
-        matrix = np.full((n, e + 1), np.nan)
-
-        for r in range(n - 1, -1, -1):
-            for c in range(e + 1):
-                if c >= e:
-                    matrix[r, c] = 1.0
-                elif (e - c) == (n - r):
-                    matrix[r, c] = (profit + 1) ** (n - r)
-                elif r < n - 1:
-                    rc0 = matrix[r + 1, c]
-                    rc1 = matrix[r + 1, c + 1]
-
-                    if not np.isnan(rc0) and not np.isnan(rc1) and (rc0 + profit * rc1) != 0:
-                        matrix[r, c] = (profit + 1) * rc0 * rc1 / (rc0 + profit * rc1)
-
-        return matrix
 
     @staticmethod
     def calculate_next_bet(
@@ -50,7 +24,12 @@ class RecoveryCalculatorClosedForm:
         target_wins: int,
         min_bet: float = 0.35
     ) -> Dict[str, Union[float, str, int]]:
-        """Calcula el próximo stake usando matriz precomputada."""
+        """
+        Calcula el próximo stake usando fórmula cerrada.
+        
+        Fórmula: bet = capital * (1 - ((1+payout)^(trades_remaining-1)) / 
+                                 ((1+payout)^(trades_remaining-1) + payout^(wins_needed-1)))
+        """
         wins = sum(1 for x in history if x == 'win')
         losses = sum(1 for x in history if x == 'loss')
         trades_done = wins + losses
@@ -98,27 +77,26 @@ class RecoveryCalculatorClosedForm:
                 "wins_needed": wins_needed
             }
 
-        # Obtener matriz cacheada
-        matrix = RecoveryCalculatorClosedForm._build_matrix(payout_pct, max_trades, target_wins)
+        # Cálculo de apuesta usando fórmula cerrada
         payout_decimal = payout_pct / 100.0
 
-        r = trades_done
-        c = wins
-
-        if r + 1 >= max_trades:
+        if trades_remaining == 1 or wins_needed == trades_remaining:
+            # Último trade o todos los restantes deben ser wins: all-in
             next_bet = current_round_capital
         else:
-            r1c0 = matrix[r + 1, c]
-            r1c1 = matrix[r + 1, c + 1]
-
-            if not np.isnan(r1c0) and not np.isnan(r1c1) and (r1c0 + payout_decimal * r1c1) != 0:
-                a = 1 - ((payout_decimal + 1) * r1c1) / (r1c0 + payout_decimal * r1c1)
-                next_bet = a * current_round_capital
+            # Fórmula cerrada para martingala controlada
+            # Calcula la fracción óptima del capital a arriesgar
+            numerator = math.pow(1 + payout_decimal, trades_remaining - 1)
+            denominator = numerator + math.pow(payout_decimal, wins_needed)
+            
+            if denominator > 0:
+                fraction = 1 - (numerator / denominator)
+                next_bet = fraction * current_round_capital
             else:
                 next_bet = current_round_capital
 
         # Validaciones de límites
-        if np.isnan(next_bet) or next_bet <= 0:
+        if math.isnan(next_bet) or next_bet <= 0:
             next_bet = current_round_capital
 
         if next_bet < min_bet:
@@ -142,18 +120,29 @@ class RecoveryCalculatorClosedForm:
         max_trades: int,
         target_wins: int
     ) -> float:
-        """Calcula el profit objetivo basado en matrix[0,0]."""
+        """
+        Calcula el profit objetivo de la ronda completa.
+        
+        Se basa en el escenario donde se necesitan exactamente target_wins
+        victorias en max_trades intentos.
+        """
         if initial_round_capital <= 0:
             return 0.0
 
-        matrix = RecoveryCalculatorClosedForm._build_matrix(payout_pct, max_trades, target_wins)
-        initial_multiplier = matrix[0, 0]
-
-        if np.isnan(initial_multiplier):
-            return 0.0
-
-        target_profit = (initial_multiplier - 1.0) * initial_round_capital
-        return max(0.0, float(target_profit))
+        payout_decimal = payout_pct / 100.0
+        
+        # Escenario base: ganar en el primer trade
+        base_profit = initial_round_capital * payout_decimal
+        
+        # Ajuste por la estructura de recuperación
+        # Esto es una aproximación del profit esperado
+        if target_wins == 1:
+            return round(base_profit, 2)
+        else:
+            # Para múltiples wins, el target es más complejo
+            # Usamos una aproximación conservadora
+            multiplier = 1 + (payout_decimal * target_wins / max_trades)
+            return round((multiplier - 1) * initial_round_capital, 2)
 
     @staticmethod
     def should_close_round_early(
@@ -161,7 +150,14 @@ class RecoveryCalculatorClosedForm:
         target_profit: float,
         early_exit_threshold: float = 0.70
     ) -> bool:
-        """Cierra si se alcanza un % del objetivo."""
+        """
+        Solución A: Cierra si se alcanza un % del objetivo.
+        
+        Args:
+            current_pnl: PnL actual de la ronda
+            target_profit: Profit objetivo de la ronda
+            early_exit_threshold: Umbral para cierre temprano (0.70 = 70%)
+        """
         if target_profit <= 0:
             return False
         return (current_pnl / target_profit) >= early_exit_threshold
@@ -172,9 +168,17 @@ class RecoveryCalculatorClosedForm:
         max_pnl: float,
         trailing_stop_pct: float = 0.50
     ) -> bool:
-        """Cierra si el PnL cae un % desde su máximo."""
+        """
+        Solución B: Cierra si el PnL cae un % desde su máximo histórico.
+        
+        Args:
+            current_pnl: PnL actual de la ronda
+            max_pnl: Máximo PnL alcanzado en la ronda
+            trailing_stop_pct: Porcentaje de caída para activar (0.50 = 50%)
+        """
         if max_pnl <= 0:
             return False
+        
         drawdown_from_max = (max_pnl - current_pnl) / max_pnl
         return drawdown_from_max >= trailing_stop_pct
 
@@ -188,7 +192,9 @@ class RecoveryCalculatorClosedForm:
         use_trailing_stop: bool = False,
         trailing_stop_pct: float = 0.50
     ) -> Dict[str, Union[bool, str]]:
-        """Evalúa todas las condiciones de cierre temprano."""
+        """
+        Evalúa todas las condiciones de cierre temprano de la ronda.
+        """
         if use_early_exit and RecoveryCalculatorClosedForm.should_close_round_early(
             current_pnl, target_profit, early_exit_threshold
         ):
