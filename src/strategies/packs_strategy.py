@@ -24,6 +24,7 @@ class ZScoreReversionConfig(BaseModel):
         description="Exige que el último tick sea menor al penúltimo (vital para entrada en T+1)",
     )
     default_duration: int = Field(default=4, ge=1, le=10)
+    contrarian: bool = Field(default=False, description="Opera en contra de la tendencia de la señal")
 
 
 class ZScoreReversionStrategy(Strategy):
@@ -65,9 +66,9 @@ class ZScoreReversionStrategy(Strategy):
 
         direction: Literal["CALL", "PUT"] | None = None
         if z_score > self.config.z_threshold:
-            direction = "PUT"
+            direction = "PUT" if not self.config.contrarian else "CALL"
         elif z_score < -self.config.z_threshold:
-            direction = "CALL"
+            direction = "CALL" if not self.config.contrarian else "PUT"
 
         if not direction:
             return None

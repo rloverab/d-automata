@@ -581,7 +581,8 @@ async def main():
         short_window=5,
         long_window=60,
         # z_threshold=2.65,
-        require_deceleration=True
+        require_deceleration=True,
+        contrarian=False
     ))
 
     # =====================================================================
