@@ -112,7 +112,8 @@ class DurationOptimizer:
         
         if not reports:
             logger.warning("⚠️ No se generaron reportes válidos")
-            return None
+            # return None
+            return 0
         
         # Calcular scores ponderados
         self._calculate_scores(reports)

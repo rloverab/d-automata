@@ -242,12 +242,12 @@ class BacktestingEngine:
             )
 
             # ✅ LOG DE DEBUGGING
-            logger.info(
-                f"💰 Stake calc | Round capital: ${self.remaining_round_capital:.2f} | "
-                f"History: {self.round_trade_results} | "
-                f"Next bet: ${bet_info.get('next_bet', 0):.2f} | "
-                f"Status: {bet_info.get('status')}"
-            )
+            # logger.info(
+            #     f"💰 Stake calc | Round capital: ${self.remaining_round_capital:.2f} | "
+            #     f"History: {self.round_trade_results} | "
+            #     f"Next bet: ${bet_info.get('next_bet', 0):.2f} | "
+            #     f"Status: {bet_info.get('status')}"
+            # )
             
             if bet_info["status"] != "ACTIVE":
                 return None
@@ -577,12 +577,17 @@ async def main():
     # =====================================================================
     # 1. REVERSIÓN POR AGOTAMIENTO DE RACHA (Z-Score + Desaceleración)
     # =====================================================================
-    # strategy = ZScoreReversionStrategy(ZScoreReversionConfig())
+    strategy = ZScoreReversionStrategy(ZScoreReversionConfig(
+        short_window=5,
+        long_window=60,
+        # z_threshold=2.65,
+        require_deceleration=True
+    ))
 
     # =====================================================================
     # 2. RUPTURA DE COMPRESIÓN DE VOLATILIDAD (Squeeze Breakout)
     # =====================================================================
-    strategy = VolatilitySqueezeStrategy(VolatilitySqueezeConfig())
+    # strategy = VolatilitySqueezeStrategy(VolatilitySqueezeConfig())
 
     # =====================================================================
     # 3. ASIMETRÍA DE MICRO-VELAS (Tick Imbalance & Absorción)
@@ -595,11 +600,11 @@ async def main():
     # strategy = ShannonEntropyStrategy(ShannonEntropyConfig())
 
     filters = [
-        VolatilityRegimeFilterV2(
-            # min_efficiency=0.3,
-            spike_multiplier=2.5,
-            window=30
-        ),
+        # VolatilityRegimeFilterV2(
+        #     # min_efficiency=0.3,
+        #     spike_multiplier=2.5,
+        #     window=30
+        # ),
     ]
 
     ticks: list[Tick] = []
@@ -610,7 +615,7 @@ async def main():
             filters=filters,
             max_concurrent_trades=1,
             initial_capital=40.0,
-            round_allocation=20.0,
+            round_allocation=10.0,
             take_profit=100.0,
             stop_loss=0.0,
             max_trades=2,
@@ -618,38 +623,17 @@ async def main():
             min_bet=0.35,
             use_fixed_stake=False,
             fixed_stake_amount=1.0,
-            duration=duration,
-            # recovery_matrix_params={
-            #     "payout_pct": 90,
-            #     "max_trades": 2,
-            #     "target_wins": 1,
-            #     "use_early_exit": False,
-            #     "early_exit_threshold": 0.9,
-            #     "use_trailing_stop": False,
-            #     "trailing_stop_pct": 0.40
-            # }
+            duration=duration
         )
         
         if len(ticks) == 0:
-            await engine.load_ticks("1HZ100V", 1*3600)
+            await engine.load_ticks("1HZ10V", 1*3600)
             ticks = engine.ticks_buffer
         else:
             engine.ticks_buffer = ticks
 
         print(f"----- Duration: {duration} -----")
         report = engine.run()
-
-    # from risk.recovery_calculator_closed_form import RecoveryCalculatorClosedForm as rccf
-    # result = ["loss", "loss", "loss", "loss", "win"]
-    # capital = 20.0
-    # for i in range(0,6):
-    #     history = result[0:i]
-    #     if len(history)>0:
-    #         capital += round(t["next_bet"]*0.9 if history[-1] == "win" else -t["next_bet"],2)
-    #     t = rccf.calculate_next_bet(history=history, current_round_capital=capital, payout_pct=90.0, max_trades=5, target_wins=1)        
-    #     print(t)
-    #     print(f"Retorno: {capital}")
-    # print(capital)
 
     # Opcional: Guardar en CouchDB
     # db.save({"type": "backtest_report", "timestamp": datetime.utcnow().isoformat(), **report})

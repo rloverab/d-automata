@@ -47,8 +47,13 @@ class TradingEngine:
         #     impulse_ticks=1, #3,
         #     min_velocity_ratio=1.1 #1.25
         # )
-        # self.strategy = ZScoreReversionStrategy(ZScoreReversionConfig())
-        self.strategy = VolatilitySqueezeStrategy(VolatilitySqueezeConfig())
+        self.strategy = ZScoreReversionStrategy(ZScoreReversionConfig(
+            short_window=5,
+            long_window=60,
+            # z_threshold=2.65,
+            require_deceleration=True
+        ))
+        # self.strategy = VolatilitySqueezeStrategy(VolatilitySqueezeConfig())
         # self.strategy = MomentumPullbackFive()
         self.filters = [
             # VolatilityFilter(filters_params.volatility),
@@ -69,9 +74,11 @@ class TradingEngine:
         self.max_trades = 2
         self.target_wins = 1
         self.min_bet = 0.35
-        self.trade_results = deque(maxlen=self.max_trades)        
-        self.capital: float = 20.0
-        self.remaining_capital: float = self.capital
+        self.trade_results = deque(maxlen=self.max_trades)
+        self.initial_capital: float = 40.0
+        self.round_allocation: float = 10.0
+        # self.remaining_capital: float = self.round_allocation
+        self.remaining_capital: float = 0.0
         self.take_profit: float = 10100.0  # TODO: Mover a config
         self.stop_loss: float = 9960.0     # TODO: Mover a config
 
@@ -111,16 +118,16 @@ class TradingEngine:
             strategy=self.strategy,
             filters=self.filters,
             duration_range=range(1, 11),
-            min_win_rate=0.55,
+            min_win_rate=0.6,
             max_trades_per_round=self.max_trades,
             payout_pct=self.payout_pct,
             min_sample_size=5,
-            hysteresis_margin=0.025#0.10
+            hysteresis_margin=0.10 #0.10
         )
         
         # Configuración del optimizador
         self._optimizer_enabled = True
-        self._optimizer_interval_seconds = 180 #300  # Cada 5 minutos
+        self._optimizer_interval_seconds = 300 #300  # Cada 5 minutos
         self._optimizer_task: Optional[asyncio.Task] = None
         self._last_optimizer_run: float = 0
 
@@ -703,8 +710,8 @@ class TradingEngine:
 
             # --- ASIGNACIÓN DE CAPITAL PARA LA NUEVA RONDA ---
             # Tu lógica: $15 por ronda si es posible. Si quedan $14, se asignan $14.
-            round_allocation = 15.0  # Puedes mover esto a `config.py`
-            new_round_capital = min(round_allocation, current_total_balance)
+            # round_allocation = 15.0  # Puedes mover esto a `config.py`
+            new_round_capital = min(self.round_allocation, current_total_balance)
 
             # 1. Guardar el capital con el que inicia la ronda
             self.initial_round_capital = new_round_capital
@@ -726,7 +733,7 @@ class TradingEngine:
             # Log de diagnóstico
             logger.info(
                 f"✅ Nueva ronda iniciada. "
-                f"Capital asignado: ${self.remaining_capital:.2f} | "
+                f"Capital asignado: ${self.remaining_capital:.2f} de ${self.round_allocation:.2f} | "
                 f"Target PnL: ${self.round_target_profit:.2f} | "
                 f"(Balance Total: ${current_total_balance:.2f})"
             )
@@ -752,7 +759,7 @@ class TradingEngine:
             "timestamp": datetime.utcnow().isoformat(),
             "symbol": self.symbol,
             "status": reason, # ej: "MAX_TRADES_REACHED", "INSUFFICIENT_CAPITAL"
-            "starting_capital": self.capital,
+            "starting_capital": self.initial_round_capital,
             "ending_capital": self.remaining_capital,
             "round_profit": net_round_profit,
             "total_trades": wins + losses,
