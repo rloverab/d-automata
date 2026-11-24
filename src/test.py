@@ -11,14 +11,15 @@ async def test():
     end: str | int = "latest"
     ticks: list[Tick] = []
 
-    for i in range(10):
+    for i in range(50):
         _ticks, _ = await mdc.ticks_history(
             symbol=SYMBOL,
             end=end
         )
         ticks += _ticks
         end = ticks[0].epoch - 1
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.5)
+    ticks = sorted(ticks, key=lambda x: x.epoch)
     timestamp = int(datetime.now().timestamp())
     TickExporter.to_jsonl(ticks=ticks, filepath=f"ticks-{timestamp}.json")
     TickExporter.to_csv(ticks=ticks, filepath=f"ticks-{timestamp}.csv")

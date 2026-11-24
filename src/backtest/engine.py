@@ -6,37 +6,42 @@ Arquitectura: Event-Loop Sincrónico con simulación estricta de delay de entrad
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import List, Optional, Dict, Any
 import logging
 import json
 
 from derivpy import Tick
-from core.models import Signal
+from core.models import Signal, TradeRecord
 from filters.base import Filter
 from filters.volatility_regime_filter_v2 import VolatilityRegimeFilterV2
 from risk.recovery_matrix_calculator import RecoveryMatrixCalculator
 from risk.recovery_calculator_closed_form import RecoveryCalculatorClosedForm as calc_bet
+from strategies.base import Strategy
+from utils.tick_exporter import TickExporter
+from utils.trade_exporter import TradeExporter
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class SimulatedTrade:
-    """Representa un trade completado con contexto financiero real."""
-    entry_epoch: float
-    exit_epoch: float
-    direction: str
-    entry_price: float
-    exit_price: float
-    duration_ticks: int
-    result: str  # 'win' | 'loss'
-    stake: float
-    pnl: float
-    balance_after: float
-    round_id: int
-    matrix_step: int  # 0 = base, 1+ = recuperación
-    signal_generation_epoch: float
-    metadata: Dict[str, Any] = field(default_factory=dict)
+# @dataclass
+# class SimulatedTrade:
+#     """Representa un trade completado con contexto financiero real."""
+#     entry_epoch: float
+#     exit_epoch: float
+#     direction: str
+#     entry_price: float
+#     exit_price: float
+#     duration_ticks: int
+#     result: str  # 'win' | 'loss'
+#     stake: float
+#     pnl: float
+#     balance_after: float
+#     round_id: int
+#     matrix_step: int  # 0 = base, 1+ = recuperación
+#     signal_generation_epoch: float
+#     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class BacktestingEngine:
@@ -71,9 +76,10 @@ class BacktestingEngine:
         use_fixed_stake: bool = False,
         fixed_stake_amount: float = 1.0,
         duration: int = 5,
+        invert_signal: bool = False,
         recovery_matrix_params: Optional[Dict] = None
     ):
-        self.strategy = strategy
+        self.strategy: Strategy = strategy
         self.filters = filters
         self.max_concurrent_trades = max_concurrent_trades
 
@@ -128,7 +134,7 @@ class BacktestingEngine:
         # Estado Interno
         self.ticks_buffer: List[Tick] = []
         self.active_trades: List[Dict] = []
-        self.completed_trades: List[SimulatedTrade] = []
+        self.completed_trades: List[TradeRecord] = []
 
         # Estado de Ronda / Martingala (alineado con TradingEngine)
         self.remaining_round_capital: float = 0.0
@@ -152,6 +158,10 @@ class BacktestingEngine:
 
         # Flag de parada
         self._stop_requested = False
+
+        # EXPERIMENTAL: Invertir señal
+        self._invert_signal = invert_signal
+        self._inverted_signal: bool = False
 
     async def load_ticks(self, symbol: str, count: int = 5000):
         """Carga histórico usando MarketDataClient."""
@@ -304,6 +314,10 @@ class BacktestingEngine:
                 min_bet=self.min_bet
             )
             if bet_check["status"] != "ACTIVE":
+                # EXPERIMENTAL: Si status == "MAX_TRADES_REACHED", invertir señal
+                if bet_check["status"] != "MAX_TRADES_REACHED" and self._invert_signal:
+                    self._inverted_signal = not self._inverted_signal
+
                 self._finalize_round(reason=bet_check["status"])
                 if not self._initialize_new_round():
                     break
@@ -319,7 +333,7 @@ class BacktestingEngine:
             buffer_slice = self.ticks_buffer[:i + 1]
 
             signal: Optional[Signal] = self.strategy.get_signal(
-                data=buffer_slice, duration=self.duration #8
+                data=buffer_slice, duration=self.duration, invert_signal=self._inverted_signal
             )
 
             if signal is None:
@@ -415,7 +429,7 @@ class BacktestingEngine:
                 if current_round_pnl > self.max_round_pnl:
                     self.max_round_pnl = current_round_pnl
 
-                sim_trade = SimulatedTrade(
+                sim_trade = TradeRecord(
                     entry_epoch=self.ticks_buffer[trade['entry_idx']].epoch,
                     exit_epoch=current_tick.epoch,
                     direction=trade['direction'],
@@ -558,58 +572,35 @@ class BacktestingEngine:
 async def main():
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s | %(levelname)s | %(message)s'
+        format="%(asctime)s | %(levelname)s | %(message)s",
     )
 
-    # Importar estrategia y filtros según necesidad
-    from strategies.momentum_pullback_velocity_strategy import MomentumPullbackVelocityStrategy
     from strategies.packs_strategy import ZScoreReversionStrategy, ZScoreReversionConfig
-    from strategies.packs_strategy import VolatilitySqueezeStrategy, VolatilitySqueezeConfig
-    from strategies.packs_strategy import TickImbalanceStrategy, TickImbalanceConfig
-    from strategies.packs_strategy import ShannonEntropyStrategy, ShannonEntropyConfig
-    # from filters.volatility_regime_filter_v2 import VolatilityRegimeFilterV2
 
-    # strategy = MomentumPullbackVelocityStrategy(
-    #     impulse_ticks=1,
-    #     min_velocity_ratio=1.1
-    # )
+    strategy = ZScoreReversionStrategy(
+        ZScoreReversionConfig(
+            # short_window=5,
+            long_window=40,
+            z_threshold=2.85, #2.75
+            # require_deceleration=True,
+            default_duration=2
+        )
+    )
 
-    # =====================================================================
-    # 1. REVERSIÓN POR AGOTAMIENTO DE RACHA (Z-Score + Desaceleración)
-    # =====================================================================
-    strategy = ZScoreReversionStrategy(ZScoreReversionConfig(
-        short_window=5,
-        long_window=60,
-        # z_threshold=2.65,
-        require_deceleration=True
-    ))
+    filters = []
+    symbol = "1HZ100V"
+    # symbol = "R_100"
+    # symbol = "JD10"
+    run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path("exports") / f"{symbol}_{run_tag}"
 
-    # =====================================================================
-    # 2. RUPTURA DE COMPRESIÓN DE VOLATILIDAD (Squeeze Breakout)
-    # =====================================================================
-    # strategy = VolatilitySqueezeStrategy(VolatilitySqueezeConfig())
-
-    # =====================================================================
-    # 3. ASIMETRÍA DE MICRO-VELAS (Tick Imbalance & Absorción)
-    # =====================================================================
-    # strategy = TickImbalanceStrategy(TickImbalanceConfig())
-
-    # =====================================================================
-    # 4. FILTRO DE ENTROPÍA DE SHANNON (Regímenes Deterministas)
-    # =====================================================================
-    # strategy = ShannonEntropyStrategy(ShannonEntropyConfig())
-
-    filters = [
-        # VolatilityRegimeFilterV2(
-        #     # min_efficiency=0.3,
-        #     spike_multiplier=2.5,
-        #     window=30
-        # ),
-    ]
+    # Limita aquí si solo quieres probar una duración específica, ej. [4] o [1, 2, 3, 4, 5]
+    durations_to_test = list(range(1, 11))
+    # durations_to_test = [strategy.config.default_duration]
 
     ticks: list[Tick] = []
 
-    for duration in range(1,11):
+    for duration in durations_to_test:
         engine = BacktestingEngine(
             strategy=strategy,
             filters=filters,
@@ -623,20 +614,113 @@ async def main():
             min_bet=0.35,
             use_fixed_stake=False,
             fixed_stake_amount=1.0,
-            duration=duration
+            duration=duration,
+            invert_signal=True
         )
-        
+
         if len(ticks) == 0:
-            await engine.load_ticks("1HZ10V", 1*3600)
+            # await engine.load_ticks(symbol, 3600)
+            await engine.load_ticks(symbol, 1800)
             ticks = engine.ticks_buffer
+            # Exportar ticks una sola vez para toda la sesión de pruebas
+            TickExporter.to_jsonl(ticks, out_dir / f"ticks_{symbol}.jsonl")
+            TickExporter.to_csv(ticks, out_dir / f"ticks_{symbol}.csv")
         else:
             engine.ticks_buffer = ticks
 
         print(f"----- Duration: {duration} -----")
         report = engine.run()
 
-    # Opcional: Guardar en CouchDB
-    # db.save({"type": "backtest_report", "timestamp": datetime.utcnow().isoformat(), **report})
+        # Exportar trades completados de esta duración
+        
+        prefix_trades = f"trades_{strategy.__class__.__name__}_{symbol}_dur{duration}t"        
+        TradeExporter.to_jsonl(engine.completed_trades, out_dir / f"{prefix_trades}.jsonl")
+        TradeExporter.to_csv(engine.completed_trades, out_dir / f"{prefix_trades}.csv")
+    prefix_ticks = f"ticks_{symbol}"
+    TickExporter.to_jsonl(ticks, out_dir / f"{prefix_ticks}.jsonl")
+    TickExporter.to_csv(ticks, out_dir / f"{prefix_ticks}.csv")
+# async def main():
+#     logging.basicConfig(
+#         level=logging.INFO,
+#         format='%(asctime)s | %(levelname)s | %(message)s'
+#     )
+
+#     # Importar estrategia y filtros según necesidad
+#     from strategies.momentum_pullback_velocity_strategy import MomentumPullbackVelocityStrategy
+#     from strategies.packs_strategy import ZScoreReversionStrategy, ZScoreReversionConfig
+#     from strategies.packs_strategy import VolatilitySqueezeStrategy, VolatilitySqueezeConfig
+#     from strategies.packs_strategy import TickImbalanceStrategy, TickImbalanceConfig
+#     from strategies.packs_strategy import ShannonEntropyStrategy, ShannonEntropyConfig
+#     # from filters.volatility_regime_filter_v2 import VolatilityRegimeFilterV2
+
+#     # strategy = MomentumPullbackVelocityStrategy(
+#     #     impulse_ticks=1,
+#     #     min_velocity_ratio=1.1
+#     # )
+
+#     # =====================================================================
+#     # 1. REVERSIÓN POR AGOTAMIENTO DE RACHA (Z-Score + Desaceleración)
+#     # =====================================================================
+#     strategy = ZScoreReversionStrategy(ZScoreReversionConfig(
+#         short_window=5,
+#         long_window=60,
+#         # z_threshold=2.65,
+#         require_deceleration=True
+#     ))
+
+#     # =====================================================================
+#     # 2. RUPTURA DE COMPRESIÓN DE VOLATILIDAD (Squeeze Breakout)
+#     # =====================================================================
+#     # strategy = VolatilitySqueezeStrategy(VolatilitySqueezeConfig())
+
+#     # =====================================================================
+#     # 3. ASIMETRÍA DE MICRO-VELAS (Tick Imbalance & Absorción)
+#     # =====================================================================
+#     # strategy = TickImbalanceStrategy(TickImbalanceConfig())
+
+#     # =====================================================================
+#     # 4. FILTRO DE ENTROPÍA DE SHANNON (Regímenes Deterministas)
+#     # =====================================================================
+#     # strategy = ShannonEntropyStrategy(ShannonEntropyConfig())
+
+#     filters = [
+#         # VolatilityRegimeFilterV2(
+#         #     # min_efficiency=0.3,
+#         #     spike_multiplier=2.5,
+#         #     window=30
+#         # ),
+#     ]
+
+#     ticks: list[Tick] = []
+
+#     for duration in range(1,11):
+#         engine = BacktestingEngine(
+#             strategy=strategy,
+#             filters=filters,
+#             max_concurrent_trades=1,
+#             initial_capital=40.0,
+#             round_allocation=10.0,
+#             take_profit=100.0,
+#             stop_loss=0.0,
+#             max_trades=2,
+#             target_wins=1,
+#             min_bet=0.35,
+#             use_fixed_stake=False,
+#             fixed_stake_amount=1.0,
+#             duration=duration
+#         )
+        
+#         if len(ticks) == 0:
+#             await engine.load_ticks("1HZ10V", 1*3600)
+#             ticks = engine.ticks_buffer
+#         else:
+#             engine.ticks_buffer = ticks
+
+#         print(f"----- Duration: {duration} -----")
+#         report = engine.run()
+
+#     # Opcional: Guardar en CouchDB
+#     # db.save({"type": "backtest_report", "timestamp": datetime.utcnow().isoformat(), **report})
 
 
 if __name__ == "__main__":

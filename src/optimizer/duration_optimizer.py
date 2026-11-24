@@ -3,16 +3,12 @@ Optimizador Dinámico de Duración de Trades
 Ejecuta backtests internos para determinar la duración óptima
 """
 
-import asyncio
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 import logging
-from copy import deepcopy
 
 from derivpy import Tick
-from core.models import Signal
 from filters.base import Filter
-from risk.recovery_calculator_closed_form import RecoveryCalculatorClosedForm as calc_bet
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +84,7 @@ class DurationOptimizer:
         Returns:
             Nueva duración óptima, o None si no se debe cambiar
         """
-        logger.info(f"🔬 Iniciando optimización de duración | Ticks: {len(ticks_buffer)}")
+        # logger.info(f"🔬 Iniciando optimización de duración | Ticks: {len(ticks_buffer)}")
         
         reports: List[DurationReport] = []
         
@@ -111,9 +107,9 @@ class DurationOptimizer:
                 continue
         
         if not reports:
-            logger.warning("⚠️ No se generaron reportes válidos")
-            # return None
-            return 0
+            # logger.warning("⚠️ No se generaron reportes válidos")
+            return None
+            # return 0
         
         # Calcular scores ponderados
         self._calculate_scores(reports)
@@ -146,11 +142,11 @@ class DurationOptimizer:
         if len(self.optimization_history) > 100:
             self.optimization_history = self.optimization_history[-100:]
         
-        logger.info(
-            f"✅ Optimización completa | "
-            f"Mejor: {best_report.duration} (score={best_report.score:.3f}) | "
-            f"Seleccionada: {new_duration}"
-        )
+        # logger.info(
+        #     f"✅ Optimización completa | "
+        #     f"Mejor: {best_report.duration} (score={best_report.score:.3f}) | "
+        #     f"Seleccionada: {new_duration}"
+        # )
         
         return new_duration
 

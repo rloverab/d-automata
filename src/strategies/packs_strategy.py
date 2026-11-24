@@ -35,6 +35,7 @@ class ZScoreReversionStrategy(Strategy):
         data: list[Candle | Tick],
         duration: int = 4,
         duration_unit: Literal["d", "m", "s", "h", "t"] = "t",
+        inverted_signal: bool = False,
         **kwargs: Any,
     ) -> Signal | None:
         if duration_unit != "t":
@@ -65,9 +66,9 @@ class ZScoreReversionStrategy(Strategy):
 
         direction: Literal["CALL", "PUT"] | None = None
         if z_score > self.config.z_threshold:
-            direction = "PUT"
+            direction = "PUT" if not inverted_signal else "CALL"
         elif z_score < -self.config.z_threshold:
-            direction = "CALL"
+            direction = "CALL" if not inverted_signal else "PUT"
 
         if not direction:
             return None
@@ -84,6 +85,7 @@ class ZScoreReversionStrategy(Strategy):
                 "z_score": round(z_score, 4),
                 "sigma_long": round(float(sigma_long), 6),
                 "last_delta": round(float(deltas[-1]), 6),
+                "inverted_signal": inverted_signal
             },
         )
 

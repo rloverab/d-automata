@@ -6,23 +6,17 @@ Arquitectura: Producer-Consumer con manejo robusto de errores
 import asyncio
 from collections import deque
 from datetime import UTC, datetime
-import json
 import math
 from typing import Optional
 import logging
 
 from derivpy import MarketDataClient, OpenContract, Tick, TradingClient
 from derivpy.exceptions import DerivAPIError, DerivConnectionError
-import numpy as np
-from config.filters_config import load_filters_config
-from config.strategies_config import load_strategies_config
 from core.models import Signal
-from filters.volatility_regime_filter_v2 import VolatilityRegimeFilterV2
 from optimizer.duration_optimizer import DurationOptimizer
-from strategies.momentum_pullback_velocity_strategy import MomentumPullbackVelocityStrategy
 from risk.recovery_calculator_closed_form import RecoveryCalculatorClosedForm as calc_bet, TradeResult
 from config.config import settings
-from strategies.packs_strategy import VolatilitySqueezeConfig, VolatilitySqueezeStrategy, ZScoreReversionConfig, ZScoreReversionStrategy
+from strategies.packs_strategy import ZScoreReversionConfig, ZScoreReversionStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +42,12 @@ class TradingEngine:
         #     min_velocity_ratio=1.1 #1.25
         # )
         self.strategy = ZScoreReversionStrategy(ZScoreReversionConfig(
-            short_window=5,
-            long_window=60,
-            # z_threshold=2.65,
-            require_deceleration=True
+            # short_window=5,
+            long_window=40,
+            # z_threshold=2.90,
+            z_threshold=2.85,
+            # require_deceleration=True
+            # default_duration=0
         ))
         # self.strategy = VolatilitySqueezeStrategy(VolatilitySqueezeConfig())
         # self.strategy = MomentumPullbackFive()
@@ -67,10 +63,10 @@ class TradingEngine:
 
             # VolatilityRegimeFilter(min_efficiency=0.30)
         ]
-        self.duration = 0
+        self.duration = self.strategy.config.default_duration
         
         # Gestión de capital
-        self.payout_pct = 91.5
+        self.payout_pct = 90.0
         self.max_trades = 2
         self.target_wins = 1
         self.min_bet = 0.35
@@ -122,14 +118,18 @@ class TradingEngine:
             max_trades_per_round=self.max_trades,
             payout_pct=self.payout_pct,
             min_sample_size=5,
-            hysteresis_margin=0.10 #0.10
+            hysteresis_margin=0.15 #0.10
         )
         
         # Configuración del optimizador
         self._optimizer_enabled = True
-        self._optimizer_interval_seconds = 300 #300  # Cada 5 minutos
+        self._optimizer_interval_seconds = 60 #300  # Cada 5 minutos
         self._optimizer_task: Optional[asyncio.Task] = None
         self._last_optimizer_run: float = 0
+
+        # EXPERIMENTAL: Invertir señal en caso de MAX_TRADES_REACHED
+        self._invert_signal: bool = False
+        self._inverted_signal: bool = True
 
     async def start(self) -> None:
         """Inicia el motor con arquitectura producer-consumer."""
@@ -288,7 +288,8 @@ class TradingEngine:
 
                 signal = self.strategy.get_signal(
                     data=list(self.ticks_buffer),
-                    duration=self.duration
+                    duration=self.duration,
+                    inverted_signal=self._inverted_signal
                 )
                 # signal = self.get_signal(duration=1)
 
@@ -414,7 +415,7 @@ class TradingEngine:
     async def _execute_trade(self, signal: Signal, bet) -> None:
         """Ejecuta un trade y maneja la activación de cooldown si es necesario."""
         try:
-            logger.info(f"💼 Ejecutando trade: {signal.direction} @ {bet['next_bet']}")
+            logger.info(f"💼 Ejecutando trade: {signal.direction} @ {bet['next_bet']} | Señal invertida: {"si" if self._inverted_signal else "no"}")
             
             if not self._trading_client.is_connected:
                 logger.error("🔌 No conectado, abortando trade")
@@ -666,6 +667,10 @@ class TradingEngine:
             if not can_continue:
                 return False # El balance global no permite seguir
 
+            # EXPERIMENTAL: Activar invertir señal ante un MAX_TRADES_REACHED
+            if bet_info["status"] == "MAX_TRADES_REACHED" and self._invert_signal:
+                self._inverted_signal = not self._inverted_signal
+
         # 3. Verificación final de seguridad (doble check)
         final_bet_info = calc_bet.calculate_next_bet(
             history=list(self.trade_results),
@@ -782,7 +787,8 @@ class TradingEngine:
         logger.info(f"🔬 Optimizador de duración iniciado | Intervalo: {self._optimizer_interval_seconds}s")
         
         # Esperar inicial antes de primera optimización
-        await asyncio.sleep(60)
+        # await asyncio.sleep(60)
+        await asyncio.sleep(15)
         
         while self._is_running:
             try:
@@ -804,7 +810,7 @@ class TradingEngine:
                 
                 # Ejecutar optimización (puede tomar varios segundos)
                 new_duration = await self.duration_optimizer.optimize(
-                    ticks_buffer=ticks_copy,
+                    ticks_buffer=ticks_copy[-1800:],
                     current_duration=self.duration
                 )
                 
@@ -818,6 +824,13 @@ class TradingEngine:
                     
                     # Opcional: Guardar en CouchDB para auditoría
                     await self._save_duration_change(old_duration, new_duration)
+                else: # EXPERIMENTAL
+                    if self.duration != self.strategy.config.default_duration:
+                        old_duration = self.duration
+                        self.duration = self.strategy.config.default_duration
+                        logger.info(
+                            f"🔄 DURACIÓN ACTUALIZADA: {old_duration} → {self.duration}"
+                        )
                 
             except asyncio.CancelledError:
                 break
@@ -867,62 +880,62 @@ class TradingEngine:
             await self._trading_client.disconnect()
             logger.info("✅ Motor detenido correctamente")
 
-    def get_signal(self, duration: int, lookback: int = 15):
-        if len(self.ticks_buffer) < lookback:
-            return None
+    # def get_signal(self, duration: int, lookback: int = 15):
+    #     if len(self.ticks_buffer) < lookback:
+    #         return None
         
-        ticks: list[Tick] = list(self.ticks_buffer)[-lookback:]
-        high_tick = max(ticks, key=lambda t: t.quote)
-        low_tick = min(ticks, key=lambda t: t.quote)
-        pip_size = ticks[-1].pip_size
-        call_signals: list[Signal] = []
-        put_signals: list[Signal] = []
-        count_none: int = 0
-        step = 1 / (10 ** pip_size)
+    #     ticks: list[Tick] = list(self.ticks_buffer)[-lookback:]
+    #     high_tick = max(ticks, key=lambda t: t.quote)
+    #     low_tick = min(ticks, key=lambda t: t.quote)
+    #     pip_size = ticks[-1].pip_size
+    #     call_signals: list[Signal] = []
+    #     put_signals: list[Signal] = []
+    #     count_none: int = 0
+    #     step = 1 / (10 ** pip_size)
 
-        for quote in np.arange(low_tick.quote, high_tick.quote + step, step):
-            ticks_buffer = self.ticks_buffer.copy()
-            tick: Tick = ticks_buffer[-1]
-            t = Tick(
-                epoch=tick.epoch + self._seconds_per_tick, 
-                quote=quote,
-                pip_size=pip_size
-            )
-            # tick.epoch += self._seconds_per_tick
-            # tick.quote = quote
-            ticks_buffer.append(t)
+    #     for quote in np.arange(low_tick.quote, high_tick.quote + step, step):
+    #         ticks_buffer = self.ticks_buffer.copy()
+    #         tick: Tick = ticks_buffer[-1]
+    #         t = Tick(
+    #             epoch=tick.epoch + self._seconds_per_tick, 
+    #             quote=quote,
+    #             pip_size=pip_size
+    #         )
+    #         # tick.epoch += self._seconds_per_tick
+    #         # tick.quote = quote
+    #         ticks_buffer.append(t)
             
-            signal = self.strategy.get_signal(
-                data=ticks_buffer,
-                duration=duration,
-                duration_unit="t"
-            )
+    #         signal = self.strategy.get_signal(
+    #             data=ticks_buffer,
+    #             duration=duration,
+    #             duration_unit="t"
+    #         )
 
-            if signal is None:
-                count_none += 1
-            else:
-                signal.data = self.ticks_buffer
+    #         if signal is None:
+    #             count_none += 1
+    #         else:
+    #             signal.data = self.ticks_buffer
 
-                if signal.direction == "CALL":
-                    call_signals.append(signal)
-                    # put_signals.append(signal)
-                else:
-                    put_signals.append(signal)
-                    # call_signals.append(signal)
+    #             if signal.direction == "CALL":
+    #                 call_signals.append(signal)
+    #                 # put_signals.append(signal)
+    #             else:
+    #                 put_signals.append(signal)
+    #                 # call_signals.append(signal)
 
-        len_call_signals: int = len(call_signals)
-        len_put_signals: int = len(put_signals)
-        total = len_call_signals + len_put_signals # + count_none
+    #     len_call_signals: int = len(call_signals)
+    #     len_put_signals: int = len(put_signals)
+    #     total = len_call_signals + len_put_signals # + count_none
 
-        if total == 0:
-            return None
+    #     if total == 0:
+    #         return None
 
-        max_threshold = 1.0
-        min_threshold = 0.51
-        if min_threshold <= (len_call_signals / total) <= max_threshold:
-            return call_signals[-1]
-        if min_threshold <= (len_put_signals / total) <= max_threshold:
-            return put_signals[-1]
+    #     max_threshold = 1.0
+    #     min_threshold = 0.51
+    #     if min_threshold <= (len_call_signals / total) <= max_threshold:
+    #         return call_signals[-1]
+    #     if min_threshold <= (len_put_signals / total) <= max_threshold:
+    #         return put_signals[-1]
                 
-        return None
+    #     return None
 

@@ -14,6 +14,7 @@ class Strategy(ABC):
             data: list[Candle|Tick],
             duration: int = 10,
             duration_unit: Literal["d", "m", "s", "h", "t"] = "t",
+            inverted_signal: bool = False,
             **kwargs: Any  # ← Extensibilidad segura
     ) -> Signal | None:
         pass

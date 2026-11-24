@@ -1,5 +1,6 @@
 import json
 import csv
+from pathlib import Path
 from typing import Iterable, Optional, Set
 
 from derivpy import Tick
@@ -29,6 +30,13 @@ class TickExporter:
         return tick.model_dump()
 
     @staticmethod
+    def _prepare_filepath(filepath: str | Path) -> Path:
+        """Convierte a Path y crea los directorios padre si no existen."""
+        path = Path(filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @staticmethod
     def to_jsonl(ticks: list['Tick'], filepath: str, exclude_fields: Optional[Iterable[str]] = None) -> None:
         """
         Exporta una lista de Ticks a un archivo JSONL (JSON Lines).
@@ -37,7 +45,8 @@ class TickExporter:
         :param filepath: Ruta del archivo de destino.
         :param exclude_fields: Iterable con los nombres de los campos a omitir.
         """
-        with open(filepath, 'w', encoding='utf-8') as f:
+        target = TickExporter._prepare_filepath(filepath)
+        with open(target, "w", encoding="utf-8") as f:
             for tick in ticks:
                 data = TickExporter._get_dump_data(tick, exclude_fields)
                 # json.dumps es rápido, pero en producción con millones de ticks 
@@ -55,12 +64,13 @@ class TickExporter:
         """
         if not ticks:
             return
-            
+
+        target = TickExporter._prepare_filepath(filepath)
         # Obtenemos los headers dinámicamente basándonos en el primer tick y las exclusiones
         first_tick_data = TickExporter._get_dump_data(ticks[0], exclude_fields)
         headers = list(first_tick_data.keys())
         
-        with open(filepath, 'w', newline='', encoding='utf-8') as f:
+        with open(target, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=headers)
             writer.writeheader()
             for tick in ticks:
