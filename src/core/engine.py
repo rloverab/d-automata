@@ -189,7 +189,7 @@ class TradingEngine:
                     break
 
                 # 🆕 Pausar ingesta de ticks si el cliente está en proceso de reconexión
-                if not self._market_data_client._connection_event.is_set():
+                if not self._market_data_client.is_connection_stable:
                     await asyncio.sleep(0.5)
                     continue
                 
@@ -256,8 +256,8 @@ class TradingEngine:
                     tick = await asyncio.wait_for(self.tick_queue.get(), timeout=1.0)
 
                     # 🆕 BLOQUEO DE SEGURIDAD: No operar si algún cliente está reconectando
-                    if (not self._market_data_client._connection_event.is_set() or 
-                        not self._trading_client._connection_event.is_set()):
+                    if (not self._market_data_client.is_connection_stable or 
+                        not self._trading_client.is_connection_stable):
                         logger.debug("⏸️ Motor pausado: Esperando estabilización de WebSockets...")
                         self.tick_queue.task_done()
                         await asyncio.sleep(1.0)
