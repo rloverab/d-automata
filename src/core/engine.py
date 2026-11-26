@@ -14,6 +14,7 @@ import logging
 from derivpy import MarketDataClient, OpenContract, Tick, TradingClient
 from derivpy.exceptions import DerivAPIError, DerivConnectionError
 from derivpy.reconnection import ReconnectionConfig, ReconnectionMode, ReconnectionEvent
+from websockets import ConnectionClosedError, ConnectionClosedOK
 from core.models import Signal
 from optimizer.duration_optimizer import DurationOptimizer
 from config.config import settings
@@ -36,8 +37,8 @@ class TradingEngine:
         
         trading_config = ReconnectionConfig(
             mode=mode,
-            max_delay=300.0,
-            force_history_reload_after=5,
+            max_delay=120.0,
+            force_history_reload_after=3,
             zombie_timeout=300.0,
             health_check_interval=30.0
         )
@@ -203,7 +204,7 @@ class TradingEngine:
         # Conectar clientes
         await self._market_data_client.connect()
         await self._trading_client.connect()
-
+        
         if not await self._initialize_new_round():
             logger.critical("❌ No se pudo inicializar la primera ronda. Deteniendo motor.")
             self._is_running = False
@@ -215,34 +216,41 @@ class TradingEngine:
         self._last_tick_received = asyncio.get_event_loop().time()
         
         try:
+            # Crear todas las tareas
             producer_task = asyncio.create_task(self._tick_producer())
             consumer_task = asyncio.create_task(self._signal_consumer())
-            health_task = asyncio.create_task(self._health_monitor())
+            health_monitor_task = asyncio.create_task(self._health_monitor())
+            connection_health_task = asyncio.create_task(self._connection_health_check())  # 🆕
+            
+            tasks = [
+                producer_task, 
+                consumer_task, 
+                health_monitor_task,
+                connection_health_task
+            ]
             
             if self._optimizer_enabled:
                 self._optimizer_task = asyncio.create_task(self._duration_optimizer_loop())
-            
-            tasks = [producer_task, consumer_task, health_task]
-            if self._optimizer_task:
                 tasks.append(self._optimizer_task)
             
-            # 🆕 FIRST_COMPLETED: reacciona a la primera tarea que falle
+            # Esperar a que alguna tarea termine
             done, pending = await asyncio.wait(
                 tasks,
                 return_when=asyncio.FIRST_COMPLETED
             )
             
+            # Cancelar tareas pendientes
             for task in pending:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
-            
+                    
         except asyncio.CancelledError:
-            logger.info("⏹️ Motor detenido de forma segura")
+            logger.info("⏹️ Motor cancelado")
         except Exception as e:
             logger.error(f"❌ Error crítico en el motor: {e}", exc_info=True)
         finally:
-            await self.stop()    
+            await self.stop() 
 
     async def _tick_producer(self) -> None:
         """
@@ -563,17 +571,41 @@ class TradingEngine:
         try:
             logger.info(f"💼 Ejecutando trade: {signal.direction} @ {bet['next_bet']} | Señal invertida: {'si' if self._inverted_signal else 'no'}")
             
-            if not self._trading_client.is_connection_stable:
-                logger.error("🔌 No conectado, abortando trade")
+            # ✅ VERIFICACIÓN PROACTIVA DE CONEXIÓN
+            if not await self._ensure_trading_connection():
+                logger.error("🔌 No se pudo establecer conexión de trading, abortando trade")
                 return
             
-            br = await self._trading_client.trade(
-                contract_type=signal.direction,
-                underlying_symbol=self.symbol,
-                amount=float(round(bet['next_bet'], 2)),
-                duration=signal.duration,
-                duration_unit=signal.duration_unit
-            )
+            # Ejecutar trade
+            try:
+                br = await self._trading_client.trade(
+                    contract_type=signal.direction,
+                    underlying_symbol=self.symbol,
+                    amount=float(round(bet['next_bet'], 2)),
+                    duration=signal.duration,
+                    duration_unit=signal.duration_unit
+                )
+            except (ConnectionClosedOK, ConnectionClosedError) as e:
+                logger.warning(f"🔌 Conexión cerrada durante trade: {e}")
+                logger.info("🔄 Intentando reconectar y reejecutar trade...")
+                
+                # Reconectar
+                if not await self._ensure_trading_connection():
+                    logger.error("❌ No se pudo reconectar, abortando trade")
+                    return
+                
+                # Reintentar el trade UNA vez
+                try:
+                    br = await self._trading_client.trade(
+                        contract_type=signal.direction,
+                        underlying_symbol=self.symbol,
+                        amount=float(round(bet['next_bet'], 2)),
+                        duration=signal.duration,
+                        duration_unit=signal.duration_unit
+                    )
+                except Exception as retry_error:
+                    logger.error(f"❌ Error en reintento de trade: {retry_error}")
+                    return
 
             max_wait = signal.duration * 2 + 30
 
@@ -966,6 +998,148 @@ class TradingEngine:
             )
         except Exception as e:
             logger.error(f"Error guardando cambio de duración: {e}")
+
+    async def _ensure_trading_connection(self, max_retries: int = 2) -> bool:
+        """
+        Verifica que la conexión de trading esté activa y la reconecta si es necesario.
+        
+        Returns:
+            True si la conexión está lista para operar, False si no se pudo establecer.
+        """
+        for attempt in range(max_retries + 1):
+            # Verificar si la conexión está estable
+            if self._trading_client.is_connection_stable:
+                return True
+            
+            # Conexión inestable: intentar reconectar
+            if attempt < max_retries:
+                logger.warning(
+                    f"🔄 Conexión de trading inestable. Intento {attempt + 1}/{max_retries} de reconexión..."
+                )
+                try:
+                    # Cerrar conexión actual (si existe)
+                    await self._trading_client.disconnect()
+                    
+                    # Esperar un momento antes de reconectar
+                    await asyncio.sleep(1.0)
+                    
+                    # Reconectar
+                    await self._trading_client.connect()
+                    
+                    # Verificar que la reconexión fue exitosa
+                    if self._trading_client.is_connection_stable:
+                        logger.info("✅ Reconexión de trading exitosa")
+                        return True
+                        
+                except Exception as e:
+                    logger.error(f"❌ Error en intento de reconexión: {e}")
+                    await asyncio.sleep(2.0)
+        
+        logger.error(f"💀 No se pudo establecer conexión de trading tras {max_retries} intentos")
+        return False
+
+    async def _connection_health_check(self) -> None:
+        """
+        Monitorea el estado de ambos clientes y fuerza reconexión si es necesario.
+        """
+        check_interval = 60.0  # Verificar cada minuto
+        max_disconnected_time = 300.0  # 5 minutos desconectado = forzar reinicio
+        
+        md_disconnected_since = None
+        trading_disconnected_since = None
+        
+        while self._is_running and not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(check_interval)
+                
+                current_time = asyncio.get_event_loop().time()
+                
+                # Verificar MarketDataClient
+                if not self._market_data_client.is_connection_stable:
+                    if md_disconnected_since is None:
+                        md_disconnected_since = current_time
+                        logger.warning("⚠️ MarketDataClient desconectado")
+                    else:
+                        disconnected_duration = current_time - md_disconnected_since
+                        if disconnected_duration > max_disconnected_time:
+                            logger.critical(
+                                f"💀 MarketDataClient desconectado por {disconnected_duration:.0f}s. "
+                                f"Forzando reconexión..."
+                            )
+                            await self._force_reconnect_market_data()
+                            md_disconnected_since = None
+                else:
+                    if md_disconnected_since is not None:
+                        logger.info("✅ MarketDataClient reconectado")
+                        md_disconnected_since = None
+                
+                # Verificar TradingClient
+                if not self._trading_client.is_connection_stable:
+                    if trading_disconnected_since is None:
+                        trading_disconnected_since = current_time
+                        logger.warning("⚠️ TradingClient desconectado")
+                    else:
+                        disconnected_duration = current_time - trading_disconnected_since
+                        if disconnected_duration > max_disconnected_time:
+                            logger.critical(
+                                f"💀 TradingClient desconectado por {disconnected_duration:.0f}s. "
+                                f"Forzando reconexión..."
+                            )
+                            await self._force_reconnect_trading()
+                            trading_disconnected_since = None
+                else:
+                    if trading_disconnected_since is not None:
+                        logger.info("✅ TradingClient reconectado")
+                        trading_disconnected_since = None
+                        
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.error(f"Error en health check: {exc}", exc_info=True)
+
+    async def _force_reconnect_trading(self) -> None:
+        """Fuerza la reconexión del TradingClient."""
+        logger.info("🔄 Forzando reconexión del TradingClient...")
+        
+        try:
+            # Cerrar conexión existente
+            if self._trading_client._ws:
+                with contextlib.suppress(Exception):
+                    await self._trading_client.disconnect()
+            
+            # Esperar un momento
+            await asyncio.sleep(2.0)
+            
+            # Reconectar
+            await self._trading_client.connect()
+            
+            if self._trading_client.is_connection_stable:
+                logger.info("✅ TradingClient reconectado exitosamente")
+            else:
+                logger.error("❌ TradingClient sigue desconectado después de reconnect forzado")
+                
+        except Exception as exc:
+            logger.error(f"Error en reconnect forzado: {exc}", exc_info=True)
+
+    async def _force_reconnect_market_data(self) -> None:
+        """Fuerza la reconexión del MarketDataClient."""
+        logger.info("🔄 Forzando reconexión del MarketDataClient...")
+        
+        try:
+            if self._market_data_client._ws:
+                with contextlib.suppress(Exception):
+                    await self._market_data_client.disconnect()
+            
+            await asyncio.sleep(2.0)
+            await self._market_data_client.connect()
+            
+            if self._market_data_client.is_connection_stable:
+                logger.info("✅ MarketDataClient reconectado exitosamente")
+            else:
+                logger.error("❌ MarketDataClient sigue desconectado después de reconnect forzado")
+                
+        except Exception as exc:
+            logger.error(f"Error en reconnect forzado: {exc}", exc_info=True)
 
     async def stop(self) -> None:
         """Detiene el motor y limpia recursos."""
