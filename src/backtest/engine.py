@@ -77,6 +77,7 @@ class BacktestingEngine:
         fixed_stake_amount: float = 1.0,
         duration: int = 5,
         invert_signal: bool = False,
+        inverted_signal: bool = False,
         recovery_matrix_params: Optional[Dict] = None
     ):
         self.strategy: Strategy = strategy
@@ -160,8 +161,8 @@ class BacktestingEngine:
         self._stop_requested = False
 
         # EXPERIMENTAL: Invertir señal
-        self._invert_signal = invert_signal
-        self._inverted_signal: bool = False
+        self._invert_signal: bool = invert_signal
+        self._inverted_signal: bool = inverted_signal
 
     async def load_ticks(self, symbol: str, count: int = 5000):
         """Carga histórico usando MarketDataClient."""
@@ -579,11 +580,11 @@ async def main():
 
     strategy = ZScoreReversionStrategy(
         ZScoreReversionConfig(
-            # short_window=5,
+            short_window=3,
             long_window=40,
             z_threshold=2.85, #2.75
             # require_deceleration=True,
-            default_duration=2
+            # default_duration=2
         )
     )
 
@@ -609,13 +610,14 @@ async def main():
             round_allocation=10.0,
             take_profit=100.0,
             stop_loss=0.0,
-            max_trades=2,
+            max_trades=3,
             target_wins=1,
             min_bet=0.35,
             use_fixed_stake=False,
             fixed_stake_amount=1.0,
             duration=duration,
-            invert_signal=True
+            invert_signal=False,
+            inverted_signal=True
         )
 
         if len(ticks) == 0:
