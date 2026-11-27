@@ -1,23 +1,22 @@
 """
-Motor de Backtesting Determinista v3.0
-Alineado con TradingEngine: Gestión de Capital Real, Rondas, Early Exit, Trailing Stop, SL/TP
+Motor de Backtesting Determinista v3.1
+Alineado con TradingEngine: Gestión de Capital Real, Rondas, Early Exit, Trailing Stop, SL/TP y Cooldown
 Arquitectura: Event-Loop Sincrónico con simulación estricta de delay de entrada
 """
 
 import asyncio
-from dataclasses import dataclass, field
+from collections import deque
 from datetime import datetime
-from pathlib import Path
-from typing import List, Optional, Dict, Any
-import logging
 import json
+import logging
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from derivpy import Tick
+
 from core.models import Signal, TradeRecord
 from filters.base import Filter
-from filters.volatility_regime_filter_v2 import VolatilityRegimeFilterV2
 from risk.recovery_matrix_calculator import RecoveryMatrixCalculator
-from risk.recovery_calculator_closed_form import RecoveryCalculatorClosedForm as calc_bet
 from strategies.base import Strategy
 from utils.tick_exporter import TickExporter
 from utils.trade_exporter import TradeExporter
@@ -25,77 +24,65 @@ from utils.trade_exporter import TradeExporter
 logger = logging.getLogger(__name__)
 
 
-# @dataclass
-# class SimulatedTrade:
-#     """Representa un trade completado con contexto financiero real."""
-#     entry_epoch: float
-#     exit_epoch: float
-#     direction: str
-#     entry_price: float
-#     exit_price: float
-#     duration_ticks: int
-#     result: str  # 'win' | 'loss'
-#     stake: float
-#     pnl: float
-#     balance_after: float
-#     round_id: int
-#     matrix_step: int  # 0 = base, 1+ = recuperación
-#     signal_generation_epoch: float
-#     metadata: Dict[str, Any] = field(default_factory=dict)
-
-
 class BacktestingEngine:
     """
     Motor de backtesting que replica fielmente la lógica de TradingEngine:
     1. Delay de entrada (señal en T, ejecución en T+1)
-    2. Duración real de la orden
+    2. Duración real de la orden en ticks
     3. Concurrencia parametrizable (default 1)
     4. Cadena de filtros pre-ejecución
-    5. Gestión de rondas con RecoveryMatrixCalculator (Early Exit, Trailing Stop)
-    6. SL/TP globales con parada inmediata post-trade
-    7. Contabilidad sin doble conteo de balance
+    5. Cooldown opcional por pérdidas consecutivas (omisión de señales)
+    6. Gestión de rondas con RecoveryMatrixCalculator (Early Exit, Trailing Stop, Viabilidad)
+    7. SL/TP globales con parada inmediata post-trade
+    8. Contabilidad alineada con el balance real
     """
 
     def __init__(
         self,
-        strategy,
+        strategy: Strategy,
         filters: List[Filter],
         max_concurrent_trades: int = 1,
-        payout_pct: float = 91.2,
+        payout_pct: float = 90.0,
         initial_capital: float = 100.0,
         round_allocation: float = 15.0,
         take_profit: Optional[float] = None,
         stop_loss: Optional[float] = None,
-        max_trades: int = 5,
+        max_trades: int = 3,
         target_wins: int = 1,
         min_bet: float = 0.35,
         use_early_exit: bool = False,
         early_exit_threshold: float = 0.70,
         use_trailing_stop: bool = False,
         trailing_stop_pct: float = 0.50,
+        use_min_viability: bool = False,
+        min_viability_pct: float = 0.10,
         use_fixed_stake: bool = False,
         fixed_stake_amount: float = 1.0,
         duration: int = 5,
         invert_signal: bool = False,
         inverted_signal: bool = False,
-        recovery_matrix_params: Optional[Dict] = None
+        use_cooldown: bool = False,
+        cooldown_threshold: int = 1,
+        cooldown_omissions: int = 1,
+        max_buffer_size: int = 3600,
     ):
         self.strategy: Strategy = strategy
         self.filters = filters
         self.max_concurrent_trades = max_concurrent_trades
+        self.max_buffer_size = max_buffer_size
 
-        # Validación de consistencia
-        if payout_pct < 1:
+        # Validación de consistencia de payout_pct (espera formato 0-100, ej. 90.0)
+        if 0 < payout_pct < 1:
             logger.warning(
                 f"⚠️ payout_pct={payout_pct} parece estar en formato decimal. "
                 f"Convirtiendo a porcentaje (×100)"
             )
             payout_pct = payout_pct * 100
-        
-        if payout_pct > 100:
-            logger.error(f"❌ payout_pct={payout_pct} es mayor a 100%. Revisa la configuración.")
-            raise ValueError("payout_pct debe estar entre 1 y 100")
-        
+
+        if payout_pct <= 0 or payout_pct > 100:
+            logger.error(f"❌ payout_pct={payout_pct} fuera de rango (0, 100].")
+            raise ValueError("payout_pct debe estar entre 0 y 100")
+
         self.payout_pct = payout_pct
 
         # Configuración de Capital
@@ -109,37 +96,44 @@ class BacktestingEngine:
         self.max_trades = max_trades
         self.target_wins = target_wins
         self.min_bet = min_bet
-        
-        # Protección de ganancias
+
+        # Protección de ganancias y viabilidad
         self.use_early_exit = use_early_exit
         self.early_exit_threshold = early_exit_threshold
         self.use_trailing_stop = use_trailing_stop
         self.trailing_stop_pct = trailing_stop_pct
+        self.use_min_viability = use_min_viability
+        self.min_viability_pct = min_viability_pct
 
         # Modo de Apuesta
         self.use_fixed_stake = use_fixed_stake
         self.fixed_stake_amount = fixed_stake_amount
 
-        # Duración de la operacion
+        # Duración de la operación
         self.duration = duration
 
-        # Recovery Matrix Setup
-        rm_params = recovery_matrix_params or {
-            "payout_pct": payout_pct * 100,
-            "max_trades": 3,
-            "target_wins": 1,
-            "use_early_exit": False
-        }
-        self.recovery_calculator = RecoveryMatrixCalculator(**rm_params)
+        # Instancia única de RecoveryMatrixCalculator (alineada con TradingEngine)
+        self.recovery_calculator = RecoveryMatrixCalculator(
+            payout_pct=self.payout_pct,
+            max_trades=self.max_trades,
+            target_wins=self.target_wins,
+            min_bet=self.min_bet,
+            use_early_exit=self.use_early_exit,
+            early_exit_threshold=self.early_exit_threshold,
+            use_trailing_stop=self.use_trailing_stop,
+            trailing_stop_pct=self.trailing_stop_pct,
+            use_min_viability=self.use_min_viability,
+            min_viability_pct=self.min_viability_pct,
+        )
 
         # Estado Interno
         self.ticks_buffer: List[Tick] = []
-        self.active_trades: List[Dict] = []
+        self.active_trades: List[Dict[str, Any]] = []
         self.completed_trades: List[TradeRecord] = []
 
-        # Estado de Ronda / Martingala (alineado con TradingEngine)
+        # Estado de Ronda (alineado con TradingEngine)
         self.remaining_round_capital: float = 0.0
-        self.round_trade_results: List[str] = []
+        self.round_trade_results: deque[str] = deque(maxlen=self.max_trades)
         self.current_round_id: int = 0
         self.round_starting_balance: float = 0.0
         self.initial_round_capital: float = 0.0
@@ -150,24 +144,34 @@ class BacktestingEngine:
         self.round_results: List[str] = []
         self.round_close_reasons: List[str] = []
 
+        # Cooldown por losses consecutivos (alineado con TradingEngine)
+        self._use_cooldown = use_cooldown
+        self._consecutive_losses = 0
+        self._cooldown_threshold = cooldown_threshold
+        self._cooldown_omissions = cooldown_omissions
+        self._in_cooldown = False
+        self._cooldown_signals_omitted = 0
+        self._cooldown_until_idx: Optional[int] = None
+
         # Métricas de Flujo
         self.signals_attempted = 0
         self.signals_generated = 0
         self.signals_passed_filter = 0
+        self.signals_omitted_cooldown = 0
         self.signals_skipped_concurrency = 0
         self.signals_skipped_capital = 0
 
         # Flag de parada
         self._stop_requested = False
 
-        # EXPERIMENTAL: Invertir señal
+        # Inversión de señal
         self._invert_signal: bool = invert_signal
         self._inverted_signal: bool = inverted_signal
 
     async def load_ticks(self, symbol: str, count: int = 5000):
         """Carga histórico usando MarketDataClient."""
-        from derivpy import MarketDataClient
         import math
+        from derivpy import MarketDataClient
 
         client = MarketDataClient()
         try:
@@ -176,7 +180,7 @@ class BacktestingEngine:
             if count > 1000:
                 batches = math.ceil(count / 1000)
                 end = "latest"
-                for i in range(batches):
+                for _ in range(batches):
                     batch_size = min(1000, count - len(all_ticks))
                     ts, _ = await client.ticks_history(symbol=symbol, count=batch_size, end=end)
                     if not ts:
@@ -192,39 +196,51 @@ class BacktestingEngine:
         finally:
             await client.disconnect()
 
+    def _check_global_limits(self) -> bool:
+        """Verifica SL, TP y balance mínimo (equivalente a TradingEngine)."""
+        if self.stop_loss is not None and self.current_balance <= self.stop_loss:
+            logger.info(f"🛑 SL GLOBAL ALCANZADO: ${self.current_balance:.2f}")
+            return False
+
+        if self.take_profit is not None and self.current_balance >= self.take_profit:
+            logger.info(f"🎯 TP GLOBAL ALCANZADO: ${self.current_balance:.2f}")
+            return False
+
+        if self.current_balance < self.min_bet:
+            logger.warning(
+                f"💀 BALANCE CRÍTICO: ${self.current_balance:.2f} < ${self.min_bet:.2f}"
+            )
+            return False
+
+        return True
+
     def _initialize_new_round(self) -> bool:
-        """Asigna capital y calcula target de ronda (igual que TradingEngine)."""
-        if self.current_balance < self.recovery_calculator.min_bet:
-            logger.warning("⛔ Balance insuficiente para nueva ronda")
+        """Asigna capital y calcula target de ronda (igual que TradingEngine._initialize_new_round)."""
+        if not self._check_global_limits():
             return False
 
         allocation = min(self.round_allocation, self.current_balance)
+        self.initial_round_capital = allocation
         self.remaining_round_capital = allocation
-        self.round_trade_results = []
+        self.round_trade_results.clear()
         self.current_round_id += 1
         self.round_starting_balance = self.current_balance
-
-        # Alineación con TradingEngine._initialize_new_round
-        self.initial_round_capital = allocation
-        # self.round_target_profit = self.recovery_calculator.get_round_target_profit(allocation)
-        self.round_target_profit = calc_bet.get_round_target_profit(
-            initial_round_capital=allocation,
-            payout_pct=self.payout_pct,
-            max_trades=self.max_trades,
-            target_wins=self.target_wins
-        )
         self.max_round_pnl = 0.0
+
+        self.round_target_profit = self.recovery_calculator.get_round_target_profit(
+            initial_round_capital=self.initial_round_capital
+        )
 
         logger.debug(
             f"🔄 Ronda #{self.current_round_id} | Capital: ${allocation:.2f} | "
-            f"Target: ${self.round_target_profit:.2f}"
+            f"Target PnL: ${self.round_target_profit:.2f}"
         )
         return True
 
     def _finalize_round(self, reason: str = "UNKNOWN") -> str:
         """Registra cierre de ronda con motivo explícito."""
-        round_pnl = self.current_balance - self.round_starting_balance
-        result = 'win' if round_pnl > 0 else 'loss'
+        round_pnl = self.remaining_round_capital - self.initial_round_capital
+        result = "win" if round_pnl > 0 else "loss"
         self.round_results.append(result)
         self.round_close_reasons.append(reason)
 
@@ -234,37 +250,66 @@ class BacktestingEngine:
         )
         return result
 
+    def _ensure_active_round(self) -> bool:
+        """
+        Replica exactamente TradingEngine._ensure_active_round().
+        Verifica si la ronda actual sigue activa; si terminó, la cierra, abre una nueva
+        y valida que sea operable.
+        """
+        if self.use_fixed_stake:
+            if self.remaining_round_capital < self.fixed_stake_amount:
+                self._consecutive_losses = 0
+                self._finalize_round("INSUFFICIENT_CAPITAL")
+                if not self._initialize_new_round():
+                    return False
+                if self.remaining_round_capital < self.fixed_stake_amount:
+                    return False
+            return True
+
+        bet_info = self.recovery_calculator.calculate_next_bet(
+            history=list(self.round_trade_results),
+            current_round_capital=self.remaining_round_capital,
+        )
+
+        if bet_info["status"] != "ACTIVE":
+            logger.debug(f"🔄 Ronda finalizada. Motivo: {bet_info['status']}.")
+            self._consecutive_losses = 0
+
+            self._finalize_round(bet_info["status"])
+
+            if not self._initialize_new_round():
+                return False
+
+            if bet_info["status"] == "MAX_TRADES_REACHED" and self._invert_signal:
+                self._inverted_signal = not self._inverted_signal
+
+        final_bet_info = self.recovery_calculator.calculate_next_bet(
+            history=list(self.round_trade_results),
+            current_round_capital=self.remaining_round_capital,
+        )
+
+        if final_bet_info["status"] != "ACTIVE":
+            logger.warning(
+                f"🛑 Imposible operar nueva ronda ({final_bet_info['status']})."
+            )
+            self._stop_requested = True
+            return False
+
+        return True
+
     def _get_next_stake(self) -> Optional[float]:
-        """Calcula el stake basado en modo fijo o matriz de recuperación."""
+        """Calcula el stake basado en modo fijo o RecoveryMatrixCalculator."""
         if self.use_fixed_stake:
             stake = self.fixed_stake_amount
         else:
-            # bet_info = self.recovery_calculator.calculate_next_bet(
-            #     self.round_trade_results,
-            #     self.remaining_round_capital
-            # )
-            bet_info = calc_bet.calculate_next_bet(
-                history=self.round_trade_results,
+            bet_info = self.recovery_calculator.calculate_next_bet(
+                history=list(self.round_trade_results),
                 current_round_capital=self.remaining_round_capital,
-                payout_pct=self.payout_pct,
-                max_trades=self.max_trades,
-                target_wins=self.target_wins,
-                min_bet=self.min_bet
             )
-
-            # ✅ LOG DE DEBUGGING
-            # logger.info(
-            #     f"💰 Stake calc | Round capital: ${self.remaining_round_capital:.2f} | "
-            #     f"History: {self.round_trade_results} | "
-            #     f"Next bet: ${bet_info.get('next_bet', 0):.2f} | "
-            #     f"Status: {bet_info.get('status')}"
-            # )
-            
             if bet_info["status"] != "ACTIVE":
                 return None
-            stake = bet_info["next_bet"]
+            stake = float(bet_info["next_bet"])
 
-        # Validación de seguridad
         if stake > self.remaining_round_capital or stake > self.current_balance:
             return None
 
@@ -279,7 +324,7 @@ class BacktestingEngine:
 
         # Iniciar primera ronda
         if not self._initialize_new_round():
-            return {"error": "Capital inicial insuficiente"}
+            return {"error": "Capital inicial insuficiente o límites alcanzados"}
 
         logger.info(
             f"🚀 Backtest | Strat: {self.strategy.__class__.__name__} | "
@@ -291,78 +336,75 @@ class BacktestingEngine:
         for i in range(start_idx, len(self.ticks_buffer)):
             current_tick = self.ticks_buffer[i]
 
-            # 1. Resolver trades expirados
+            # 1. Resolver trades expirados en este tick
             self._resolve_expiring_trades(i, current_tick)
 
-            # Parada inmediata por SL/TP o flag interno
-            if self._stop_requested:
-                break
-            if self.take_profit and self.current_balance >= self.take_profit:
-                logger.info(f"🎯 TP GLOBAL: ${self.current_balance:.2f}")
-                break
-            if self.stop_loss and self.current_balance <= self.stop_loss:
-                logger.info(f"🛑 SL GLOBAL: ${self.current_balance:.2f}")
+            if self._stop_requested or not self._check_global_limits():
                 break
 
-            # 2. Verificar estado de ronda ANTES de buscar señal
-            # Equivalente a TradingEngine._ensure_active_round()
-            bet_check = calc_bet.calculate_next_bet(
-                history=self.round_trade_results,
-                current_round_capital=self.remaining_round_capital,
-                payout_pct=self.payout_pct,
-                max_trades=self.max_trades,
-                target_wins=self.target_wins,
-                min_bet=self.min_bet
-            )
-            if bet_check["status"] != "ACTIVE":
-                # EXPERIMENTAL: Si status == "MAX_TRADES_REACHED", invertir señal
-                if bet_check["status"] != "MAX_TRADES_REACHED" and self._invert_signal:
-                    self._inverted_signal = not self._inverted_signal
+            # 2. Gestionar cooldown virtual en curso (simula el tiempo de espera de signal.duration)
+            if self._in_cooldown and self._cooldown_until_idx is not None:
+                if i >= self._cooldown_until_idx:
+                    self._cooldown_until_idx = None
+                    self._cooldown_signals_omitted += 1
+                    if self._cooldown_signals_omitted >= self._cooldown_omissions:
+                        self._in_cooldown = False
+                        self._cooldown_signals_omitted = 0
+                        self._consecutive_losses = 0
+                else:
+                    self.signals_skipped_concurrency += 1
+                    continue
 
-                self._finalize_round(reason=bet_check["status"])
-                if not self._initialize_new_round():
-                    break
-                continue  # Re-evaluar en siguiente tick con nueva ronda
+            # 3. Verificar estado de ronda ANTES de evaluar señal (TradingEngine._ensure_active_round)
+            if not self._ensure_active_round():
+                break
 
-            # 3. Concurrencia
+            # 4. Concurrencia (TradingEngine._can_execute_trade)
             if len(self.active_trades) >= self.max_concurrent_trades:
                 self.signals_skipped_concurrency += 1
                 continue
 
-            # 4. Evaluar Estrategia
+            if self.duration == 0:
+                continue
+
+            # 5. Evaluar Estrategia (ventana acotada como deque(maxlen=3600) en TradingEngine)
             self.signals_attempted += 1
-            buffer_slice = self.ticks_buffer[:i + 1]
+            window_start = max(0, i + 1 - self.max_buffer_size)
+            buffer_slice = self.ticks_buffer[window_start : i + 1]
 
             signal: Optional[Signal] = self.strategy.get_signal(
-                data=buffer_slice, duration=self.duration, invert_signal=self._inverted_signal
+                data=buffer_slice,
+                duration=self.duration,
+                inverted_signal=self._inverted_signal,
             )
 
             if signal is None:
                 continue
             self.signals_generated += 1
 
-            # 5. Filtros
-            filtered_signal = signal
-            for f in self.filters:
-                filtered_signal = f(filtered_signal)
+            # 6. Cadena de Filtros
+            filtered_signal: Optional[Signal] = signal
+            for flt in self.filters:
+                filtered_signal = flt(filtered_signal)
                 if filtered_signal is None:
                     break
             if filtered_signal is None:
                 continue
             self.signals_passed_filter += 1
 
-            # 6. Obtener Stake
+            # 7. Cooldown por omisión de señal (igual que TradingEngine._signal_consumer)
+            if self._in_cooldown:
+                self.signals_omitted_cooldown += 1
+                self._cooldown_until_idx = i + filtered_signal.duration
+                continue
+
+            # 8. Obtener Stake
             stake = self._get_next_stake()
             if stake is None:
-                self._finalize_round(reason="INSUFFICIENT_STAKE")
-                if not self._initialize_new_round():
-                    break
-                stake = self._get_next_stake()
-                if stake is None:
-                    self.signals_skipped_capital += 1
-                    continue
+                self.signals_skipped_capital += 1
+                continue
 
-            # 7. Ejecución con Delay (T+1)
+            # 9. Ejecución con Delay (T+1)
             next_idx = i + 1
             if next_idx >= len(self.ticks_buffer):
                 break
@@ -373,114 +415,131 @@ class BacktestingEngine:
             if exit_idx >= len(self.ticks_buffer):
                 break
 
-            # CORRECCIÓN: Solo reservar del capital de ronda, NO de current_balance
-            self.remaining_round_capital -= stake
-
+            # Reservar stake del capital de ronda
+            self.remaining_round_capital = round(self.remaining_round_capital - stake, 2)
             matrix_step = len(self.round_trade_results) if not self.use_fixed_stake else 0
 
-            self.active_trades.append({
-                'entry_idx': next_idx,
-                'exit_idx': exit_idx,
-                'direction': filtered_signal.direction,
-                'entry_price': entry_tick.quote,
-                'stake': stake,
-                'signal_epoch': current_tick.epoch,
-                'duration': filtered_signal.duration,
-                'matrix_step': matrix_step,
-                'metadata': getattr(filtered_signal, 'extras', {})
-            })
+            self.active_trades.append(
+                {
+                    "entry_idx": next_idx,
+                    "exit_idx": exit_idx,
+                    "direction": filtered_signal.direction,
+                    "entry_price": entry_tick.quote,
+                    "stake": stake,
+                    "signal_epoch": current_tick.epoch,
+                    "duration": filtered_signal.duration,
+                    "matrix_step": matrix_step,
+                    "metadata": getattr(filtered_signal, "extras", {}),
+                }
+            )
 
-        # Cerrar última ronda si quedó activa
+        # Cerrar última ronda si quedó con trades registrados y no se finalizó
         if len(self.round_trade_results) > 0:
             self._finalize_round(reason="END_OF_DATA")
 
         return self._generate_report()
 
     def _resolve_expiring_trades(self, current_idx: int, current_tick: Tick):
-        """Resuelve trades expirados con contabilidad limpia y evaluación de cierre temprano."""
+        """Resuelve trades expirados y evalúa cierres tempranos alineados con TradingEngine."""
         still_active = []
         should_stop = False
 
         for trade in self.active_trades:
-            if trade['exit_idx'] == current_idx:
+            if trade["exit_idx"] == current_idx:
                 exit_price = current_tick.quote
-                entry_price = trade['entry_price']
-                stake = trade['stake']
+                entry_price = trade["entry_price"]
+                stake = trade["stake"]
 
-                is_win = (trade['direction'] == 'CALL' and exit_price > entry_price) or \
-                         (trade['direction'] == 'PUT' and exit_price < entry_price)
+                is_win = (
+                    trade["direction"] == "CALL" and exit_price > entry_price
+                ) or (
+                    trade["direction"] == "PUT" and exit_price < entry_price
+                )
 
-                # Contabilidad limpia: sin doble conteo
                 if is_win:
-                    profit = stake * round(self.payout_pct / 100.0, 2)
+                    profit = round(stake * (self.payout_pct / 100.0), 2)
                     pnl = profit
-                    self.remaining_round_capital += stake + profit
+                    self.remaining_round_capital = round(
+                        self.remaining_round_capital + stake + profit, 2
+                    )
                 else:
-                    profit = 0.0
                     pnl = -stake
 
-                self.current_balance += pnl
-                # self.remaining_round_capital += stake + pnl  # Devolver stake al pool + resultado
+                self.current_balance = round(self.current_balance + pnl, 2)
 
-                result_str = 'win' if is_win else 'loss'
+                result_str = "win" if is_win else "loss"
                 self.round_trade_results.append(result_str)
 
-                # Actualizar max_round_pnl para Trailing Stop
-                current_round_pnl = self.current_balance - self.initial_round_capital
+                # Actualizar racha de pérdidas para cooldown
+                should_activate_cooldown = False
+                if self._use_cooldown:
+                    if result_str == "loss":
+                        self._consecutive_losses += 1
+                        if self._consecutive_losses >= self._cooldown_threshold:
+                            should_activate_cooldown = True
+                    else:
+                        self._consecutive_losses = 0
+
+                # CORRECCIÓN CRÍTICA: PnL de la ronda respecto a initial_round_capital
+                current_round_pnl = round(
+                    self.remaining_round_capital - self.initial_round_capital, 2
+                )
                 if current_round_pnl > self.max_round_pnl:
                     self.max_round_pnl = current_round_pnl
 
                 sim_trade = TradeRecord(
-                    entry_epoch=self.ticks_buffer[trade['entry_idx']].epoch,
+                    entry_epoch=self.ticks_buffer[trade["entry_idx"]].epoch,
                     exit_epoch=current_tick.epoch,
-                    direction=trade['direction'],
+                    direction=trade["direction"],
                     entry_price=entry_price,
                     exit_price=exit_price,
-                    duration_ticks=trade['duration'],
+                    duration_ticks=trade["duration"],
                     result=result_str,
                     stake=stake,
                     pnl=pnl,
                     balance_after=self.current_balance,
                     round_id=self.current_round_id,
-                    matrix_step=trade['matrix_step'],
-                    signal_generation_epoch=trade['signal_epoch'],
-                    metadata=trade['metadata']
+                    matrix_step=trade["matrix_step"],
+                    signal_generation_epoch=trade["signal_epoch"],
+                    metadata=trade["metadata"],
                 )
                 self.completed_trades.append(sim_trade)
 
                 logger.debug(
                     f"📊 Trade: {result_str} | Stake: ${stake:.2f} | "
-                    f"PnL: ${pnl:.2f} | Balance: ${self.current_balance:.2f}"
+                    f"PnL: ${pnl:.2f} | RoundPnL: ${current_round_pnl:.2f} | "
+                    f"Balance: ${self.current_balance:.2f}"
                 )
 
-                # Evaluar cierre temprano de ronda (Early Exit + Trailing Stop)
-                close_decision = calc_bet.should_close_round(
+                # Evaluar cierre temprano usando RecoveryMatrixCalculator (igual que TradingEngine)
+                close_decision = self.recovery_calculator.should_close_round(
                     current_pnl=current_round_pnl,
                     target_profit=self.round_target_profit,
                     max_pnl=self.max_round_pnl,
-                    use_early_exit=self.use_early_exit,
-                    early_exit_threshold=self.early_exit_threshold,
-                    use_trailing_stop=self.use_trailing_stop,
-                    trailing_stop_pct=self.trailing_stop_pct
                 )
 
                 if close_decision["close"]:
-                    logger.info(
-                        f"🏁 Cierre temprano: {close_decision['reason']} | "
-                        f"PnL Ronda: ${current_round_pnl:.2f}"
+                    reason = (
+                        "EARLY_EXIT_PROFIT_THRESHOLD"
+                        if close_decision["reason"] == "EARLY_EXIT"
+                        else "TRAILING_STOP_ACTIVATED"
                     )
-                    self._finalize_round(reason=close_decision["reason"])
-                    self._initialize_new_round()
+                    logger.info(
+                        f"🏁 Cierre temprano: {reason} | PnL Ronda: ${current_round_pnl:.2f}"
+                    )
+                    self._finalize_round(reason=reason)
+                    if not self._initialize_new_round():
+                        should_stop = True
+                        break
+                    continue
 
-                # Verificación SL/TP global inmediata post-trade
-                if self.take_profit and self.current_balance >= self.take_profit:
-                    logger.info(f"🎯 TP GLOBAL: ${self.current_balance:.2f}")
+                if not self._check_global_limits():
                     should_stop = True
                     break
-                if self.stop_loss and self.current_balance <= self.stop_loss:
-                    logger.info(f"🛑 SL GLOBAL: ${self.current_balance:.2f}")
-                    should_stop = True
-                    break
+
+                if should_activate_cooldown:
+                    self._in_cooldown = True
+                    self._cooldown_signals_omitted = 0
 
             else:
                 still_active.append(trade)
@@ -495,35 +554,33 @@ class BacktestingEngine:
         if total == 0:
             return {"error": "No se completaron trades en el backtest"}
 
-        wins = sum(1 for t in self.completed_trades if t.result == 'win')
-        losses = total - wins
+        wins = sum(1 for t in self.completed_trades if t.result == "win")
         gross_profit = sum(t.pnl for t in self.completed_trades if t.pnl > 0)
         gross_loss = abs(sum(t.pnl for t in self.completed_trades if t.pnl < 0))
 
         # Racha máxima de pérdidas de trades
         max_consec_loss = curr = 0
         for t in self.completed_trades:
-            if t.result == 'loss':
+            if t.result == "loss":
                 curr += 1
                 max_consec_loss = max(max_consec_loss, curr)
             else:
                 curr = 0
 
         # Métricas de rondas
-        rounds_won = sum(1 for r in self.round_results if r == 'win')
-        rounds_lost = sum(1 for r in self.round_results if r == 'loss')
+        rounds_won = sum(1 for r in self.round_results if r == "win")
+        rounds_lost = sum(1 for r in self.round_results if r == "loss")
         total_rounds = len(self.round_results)
 
         max_consec_round_loss = curr_round = 0
         for r in self.round_results:
-            if r == 'loss':
+            if r == "loss":
                 curr_round += 1
                 max_consec_round_loss = max(max_consec_round_loss, curr_round)
             else:
                 curr_round = 0
 
-        # Distribución de motivos de cierre
-        close_reason_counts = {}
+        close_reason_counts: Dict[str, int] = {}
         for reason in self.round_close_reasons:
             close_reason_counts[reason] = close_reason_counts.get(reason, 0) + 1
 
@@ -540,8 +597,9 @@ class BacktestingEngine:
                     self.signals_passed_filter / max(1, self.signals_generated), 4
                 ),
                 "executed": total,
+                "omitted_cooldown": self.signals_omitted_cooldown,
                 "skipped_concurrency": self.signals_skipped_concurrency,
-                "skipped_capital": self.signals_skipped_capital
+                "skipped_capital": self.signals_skipped_capital,
             },
             "round_metrics": {
                 "total_rounds": total_rounds,
@@ -549,18 +607,20 @@ class BacktestingEngine:
                 "rounds_lost": rounds_lost,
                 "round_win_rate": round(rounds_won / max(1, total_rounds), 4),
                 "max_consecutive_round_losses": max_consec_round_loss,
-                "close_reasons": close_reason_counts
+                "close_reasons": close_reason_counts,
             },
             "performance": {
                 "initial_capital": self.initial_capital,
                 "final_balance": round(self.current_balance, 2),
                 "net_pnl": round(self.current_balance - self.initial_capital, 2),
                 "win_rate": round(wins / total, 4),
-                "profit_factor": round(gross_profit / gross_loss, 4) if gross_loss > 0 else float('inf'),
+                "profit_factor": round(gross_profit / gross_loss, 4)
+                if gross_loss > 0
+                else float("inf"),
                 "max_consecutive_losses": max_consec_loss,
                 "gross_profit": round(gross_profit, 2),
-                "gross_loss": round(gross_loss, 2)
-            }
+                "gross_loss": round(gross_loss, 2),
+            },
         }
 
         logger.info(json.dumps(report, indent=2))
@@ -576,29 +636,22 @@ async def main():
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
 
-    from strategies.packs_strategy import ZScoreReversionStrategy, ZScoreReversionConfig
+    from strategies.packs_strategy import ZScoreReversionConfig, ZScoreReversionStrategy
 
     strategy = ZScoreReversionStrategy(
         ZScoreReversionConfig(
             short_window=3,
             long_window=40,
-            z_threshold=2.85, #2.75
-            # require_deceleration=True,
-            # default_duration=2
+            z_threshold=2.85,
         )
     )
 
     filters = []
     symbol = "1HZ100V"
-    # symbol = "R_100"
-    # symbol = "JD10"
     run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path("exports") / f"{symbol}_{run_tag}"
 
-    # Limita aquí si solo quieres probar una duración específica, ej. [4] o [1, 2, 3, 4, 5]
     durations_to_test = list(range(1, 11))
-    # durations_to_test = [strategy.config.default_duration]
-
     ticks: list[Tick] = []
 
     for duration in durations_to_test:
@@ -606,6 +659,7 @@ async def main():
             strategy=strategy,
             filters=filters,
             max_concurrent_trades=1,
+            payout_pct=90.0,
             initial_capital=40.0,
             round_allocation=10.0,
             take_profit=100.0,
@@ -617,112 +671,23 @@ async def main():
             fixed_stake_amount=1.0,
             duration=duration,
             invert_signal=False,
-            inverted_signal=True
+            inverted_signal=False,
         )
 
         if len(ticks) == 0:
-            # await engine.load_ticks(symbol, 3600)
             await engine.load_ticks(symbol, 1800)
             ticks = engine.ticks_buffer
-            # Exportar ticks una sola vez para toda la sesión de pruebas
             TickExporter.to_jsonl(ticks, out_dir / f"ticks_{symbol}.jsonl")
             TickExporter.to_csv(ticks, out_dir / f"ticks_{symbol}.csv")
         else:
             engine.ticks_buffer = ticks
 
         print(f"----- Duration: {duration} -----")
-        report = engine.run()
+        engine.run()
 
-        # Exportar trades completados de esta duración
-        
-        prefix_trades = f"trades_{strategy.__class__.__name__}_{symbol}_dur{duration}t"        
+        prefix_trades = f"trades_{strategy.__class__.__name__}_{symbol}_dur{duration}t"
         TradeExporter.to_jsonl(engine.completed_trades, out_dir / f"{prefix_trades}.jsonl")
         TradeExporter.to_csv(engine.completed_trades, out_dir / f"{prefix_trades}.csv")
-    prefix_ticks = f"ticks_{symbol}"
-    TickExporter.to_jsonl(ticks, out_dir / f"{prefix_ticks}.jsonl")
-    TickExporter.to_csv(ticks, out_dir / f"{prefix_ticks}.csv")
-# async def main():
-#     logging.basicConfig(
-#         level=logging.INFO,
-#         format='%(asctime)s | %(levelname)s | %(message)s'
-#     )
-
-#     # Importar estrategia y filtros según necesidad
-#     from strategies.momentum_pullback_velocity_strategy import MomentumPullbackVelocityStrategy
-#     from strategies.packs_strategy import ZScoreReversionStrategy, ZScoreReversionConfig
-#     from strategies.packs_strategy import VolatilitySqueezeStrategy, VolatilitySqueezeConfig
-#     from strategies.packs_strategy import TickImbalanceStrategy, TickImbalanceConfig
-#     from strategies.packs_strategy import ShannonEntropyStrategy, ShannonEntropyConfig
-#     # from filters.volatility_regime_filter_v2 import VolatilityRegimeFilterV2
-
-#     # strategy = MomentumPullbackVelocityStrategy(
-#     #     impulse_ticks=1,
-#     #     min_velocity_ratio=1.1
-#     # )
-
-#     # =====================================================================
-#     # 1. REVERSIÓN POR AGOTAMIENTO DE RACHA (Z-Score + Desaceleración)
-#     # =====================================================================
-#     strategy = ZScoreReversionStrategy(ZScoreReversionConfig(
-#         short_window=5,
-#         long_window=60,
-#         # z_threshold=2.65,
-#         require_deceleration=True
-#     ))
-
-#     # =====================================================================
-#     # 2. RUPTURA DE COMPRESIÓN DE VOLATILIDAD (Squeeze Breakout)
-#     # =====================================================================
-#     # strategy = VolatilitySqueezeStrategy(VolatilitySqueezeConfig())
-
-#     # =====================================================================
-#     # 3. ASIMETRÍA DE MICRO-VELAS (Tick Imbalance & Absorción)
-#     # =====================================================================
-#     # strategy = TickImbalanceStrategy(TickImbalanceConfig())
-
-#     # =====================================================================
-#     # 4. FILTRO DE ENTROPÍA DE SHANNON (Regímenes Deterministas)
-#     # =====================================================================
-#     # strategy = ShannonEntropyStrategy(ShannonEntropyConfig())
-
-#     filters = [
-#         # VolatilityRegimeFilterV2(
-#         #     # min_efficiency=0.3,
-#         #     spike_multiplier=2.5,
-#         #     window=30
-#         # ),
-#     ]
-
-#     ticks: list[Tick] = []
-
-#     for duration in range(1,11):
-#         engine = BacktestingEngine(
-#             strategy=strategy,
-#             filters=filters,
-#             max_concurrent_trades=1,
-#             initial_capital=40.0,
-#             round_allocation=10.0,
-#             take_profit=100.0,
-#             stop_loss=0.0,
-#             max_trades=2,
-#             target_wins=1,
-#             min_bet=0.35,
-#             use_fixed_stake=False,
-#             fixed_stake_amount=1.0,
-#             duration=duration
-#         )
-        
-#         if len(ticks) == 0:
-#             await engine.load_ticks("1HZ10V", 1*3600)
-#             ticks = engine.ticks_buffer
-#         else:
-#             engine.ticks_buffer = ticks
-
-#         print(f"----- Duration: {duration} -----")
-#         report = engine.run()
-
-#     # Opcional: Guardar en CouchDB
-#     # db.save({"type": "backtest_report", "timestamp": datetime.utcnow().isoformat(), **report})
 
 
 if __name__ == "__main__":
