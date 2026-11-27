@@ -5,11 +5,11 @@ Arquitectura: Producer-Consumer con manejo robusto de errores y reconexión unif
 """
 
 import asyncio
+from collections import deque
 import contextlib
+from datetime import UTC, datetime
 import logging
 import math
-from collections import deque
-from datetime import UTC, datetime
 from typing import Optional
 
 from derivpy import MarketDataClient, OpenContract, Tick, TradingClient
@@ -75,7 +75,7 @@ class TradingEngine:
                 short_window=3,
                 long_window=40,
                 z_threshold=2.85,
-                default_duration=3,
+                default_duration=4,
             )
         )
         self.filters = []
@@ -129,7 +129,13 @@ class TradingEngine:
         self._cooldown_until_epoch: Optional[float] = None
         self._seconds_per_tick = 0.0
 
-        # Optimizador de duración
+        # Optimizador de duración y polaridad de señal
+        self._optimizer_enabled = True
+        self._optimizer_invert_enabled = True
+        self._optimizer_interval_seconds = 60
+        self._optimizer_task: Optional[asyncio.Task] = None
+        self._last_optimizer_run: float = 0
+
         self.duration_optimizer = DurationOptimizer(
             strategy=self.strategy,
             filters=self.filters,
@@ -139,15 +145,12 @@ class TradingEngine:
             payout_pct=self.payout_pct,
             min_sample_size=5,
             hysteresis_margin=0.15,
+            evaluate_inversion=self._optimizer_invert_enabled,
+            max_buffer_size=3600,
         )
 
-        self._optimizer_enabled = False
-        self._optimizer_interval_seconds = 60
-        self._optimizer_task: Optional[asyncio.Task] = None
-        self._last_optimizer_run: float = 0
-
         self._invert_signal: bool = False
-        self._inverted_signal: bool = True
+        self._inverted_signal: bool = False
 
         self.session_start_balance: float = 0.0
 
@@ -237,6 +240,7 @@ class TradingEngine:
             ]
 
             if self._optimizer_enabled:
+                self.duration_optimizer.evaluate_inversion = self._optimizer_invert_enabled
                 self._optimizer_task = asyncio.create_task(
                     self._duration_optimizer_loop(), name="engine-optimizer"
                 )
@@ -818,7 +822,11 @@ class TradingEngine:
             if not can_continue:
                 return False
 
-            if bet_info["status"] == "MAX_TRADES_REACHED" and self._invert_signal:
+            if (
+                not self._optimizer_invert_enabled
+                and bet_info["status"] == "MAX_TRADES_REACHED"
+                and self._invert_signal
+            ):
                 self._inverted_signal = not self._inverted_signal
 
         final_bet_info = self.recovery_calculator.calculate_next_bet(
@@ -910,7 +918,8 @@ class TradingEngine:
     async def _duration_optimizer_loop(self) -> None:
         """Tarea en background que ejecuta el optimizador periódicamente."""
         logger.info(
-            f"🔬 Optimizador de duración iniciado | Intervalo: {self._optimizer_interval_seconds}s"
+            f"🔬 Optimizador iniciado | Intervalo: {self._optimizer_interval_seconds}s | "
+            f"Evaluar inversión: {self._optimizer_invert_enabled}"
         )
 
         await asyncio.sleep(15)
@@ -930,21 +939,37 @@ class TradingEngine:
                     await asyncio.sleep(30)
                     continue
 
-                new_duration = await self.duration_optimizer.optimize(
-                    ticks_buffer=ticks_copy[-1800:],
+                self.duration_optimizer.evaluate_inversion = self._optimizer_invert_enabled
+                decision = await self.duration_optimizer.optimize_with_inversion(
+                    ticks_buffer=ticks_copy,
                     current_duration=self.duration,
+                    current_inverted=self._inverted_signal,
                 )
 
-                if new_duration is not None and new_duration != self.duration:
+                changed = False
+
+                # Si no hay duración recomendada, se conserva la duración actual
+                if decision.duration is not None and decision.duration != self.duration:
                     old_duration = self.duration
-                    self.duration = new_duration
-                    logger.info(f"🔄 DURACIÓN ACTUALIZADA: {old_duration} → {new_duration}")
-                    await self._save_duration_change(old_duration, new_duration)
-                else:
-                    if self.duration != self.strategy.config.default_duration:
-                        old_duration = self.duration
-                        self.duration = self.strategy.config.default_duration
-                        logger.info(f"🔄 DURACIÓN ACTUALIZADA: {old_duration} → {self.duration}")
+                    self.duration = decision.duration
+                    changed = True
+                    logger.info(f"🔄 DURACIÓN ACTUALIZADA: {old_duration} → {self.duration}")
+
+                # Si se evalúa inversión y hay recomendación, actualizar; si es None, conservar actual
+                if (
+                    self._optimizer_invert_enabled
+                    and decision.inverted_signal is not None
+                    and decision.inverted_signal != self._inverted_signal
+                ):
+                    old_inverted = self._inverted_signal
+                    self._inverted_signal = decision.inverted_signal
+                    changed = True
+                    logger.info(
+                        f"🔀 INVERSIÓN DE SEÑAL ACTUALIZADA: {old_inverted} → {self._inverted_signal}"
+                    )
+
+                if changed:
+                    await self._save_optimizer_change()
 
             except asyncio.CancelledError:
                 break
@@ -954,15 +979,16 @@ class TradingEngine:
 
         logger.info("🔬 Optimizador de duración detenido")
 
-    async def _save_duration_change(self, old_duration: int, new_duration: int) -> None:
-        """Guarda cambio de duración en CouchDB para auditoría."""
+    async def _save_optimizer_change(self) -> None:
+        """Guarda cambios del optimizador en CouchDB para auditoría."""
         try:
             logger.debug(
-                f"💾 Cambio de duración: {old_duration} → {new_duration} "
+                f"💾 Cambio de optimizador -> Duración: {self.duration}, "
+                f"Invertida: {self._inverted_signal} "
                 f"| Resumen: {self.duration_optimizer.get_recommendation_summary()}"
             )
         except Exception as e:
-            logger.error(f"Error guardando cambio de duración: {e}")
+            logger.error(f"Error guardando cambio de optimizador: {e}")
 
     async def _ensure_trading_connection(self, timeout: float = 15.0) -> bool:
         """
